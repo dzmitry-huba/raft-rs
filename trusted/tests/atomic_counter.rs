@@ -241,7 +241,7 @@ impl FakeCluster {
 
             let pull_messages = self.extract_pull_messages(condition);
 
-            if pull_messages.len() > 0 {
+            if !pull_messages.is_empty() {
                 return pull_messages;
             }
         }
@@ -305,8 +305,8 @@ impl FakeCluster {
             name: counter_name,
             op: Some(counter_request::Op::CompareAndSwap(
                 CounterCompareAndSwapRequest {
-                    expected_value: expected_value,
-                    new_value: new_value,
+                    expected_value,
+                    new_value,
                 },
             )),
         });
