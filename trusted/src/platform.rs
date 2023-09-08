@@ -191,7 +191,7 @@ pub trait Application {
     /// mesured in milliseconds. Instants are opaque that can only be compared to one
     /// another. In other words the absolute value must not be interpretted as wall
     /// clock time or time since the trusted application start.
-    /// * `messages` - A potentially empty set of messages received from the untrusted
+    /// * `opt_message` - A potentially empty message received from the untrusted
     /// launcher for the trusted application to process.
     ///
     /// # Returns
@@ -199,10 +199,10 @@ pub trait Application {
     /// Error if the trusted application encountered an unrecoverable error and must
     /// be terminated, a success otherwise. The application level recoverable errors
     /// are represented and communicated using messages.
-    fn receive_messages(
+    fn receive_message(
         &mut self,
         host: &mut impl Host,
         instant: u64,
-        messages: &[MessageEnvelope],
+        opt_message: Option<MessageEnvelope>,
     ) -> Result<(), PalError>;
 }

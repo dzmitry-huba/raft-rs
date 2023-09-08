@@ -417,9 +417,17 @@ impl FakePlatform {
         let mut driver = self.driver.borrow_mut();
         let mut host = self.host.borrow_mut();
 
-        driver
-            .receive_messages(&mut *host, self.instant, &messages)
-            .unwrap()
+        if messages.is_empty() {
+            driver
+                .receive_message(&mut *host, self.instant, None)
+                .unwrap();
+        } else {
+            for message in messages {
+                driver
+                    .receive_message(&mut *host, self.instant, Some(message))
+                    .unwrap()
+            }
+        }
     }
 
     fn take_messages_out(&mut self) -> Vec<EnvelopeOut> {

@@ -652,14 +652,16 @@ impl Driver {
     }
 
     fn process_state_machine(&mut self) -> Result<Vec<EnvelopeOut>, PalError> {
-        // Advance raft internal state.
-        self.advance_raft()?;
+        if self.raft_node.is_some() {
+            // Advance raft internal state.
+            self.advance_raft()?;
 
-        // Maybe create a snashot of the actor to reduce the size of the log.
-        self.maybe_create_raft_snapshot()?;
+            // Maybe create a snashot of the actor to reduce the size of the log.
+            self.maybe_create_raft_snapshot()?;
 
-        // If the leader state has changed send it out for observability.
-        self.send_leader_state();
+            // If the leader state has changed send it out for observability.
+            self.send_leader_state();
+        }
 
         // Take messages to be sent out.
         Ok(mem::take(&mut self.messages))
@@ -690,15 +692,19 @@ impl Driver {
 }
 
 impl Application for Driver {
-    fn receive_messages(
+    /// Handles messages received from the trusted host.
+    fn receive_message(
         &mut self,
         host: &mut impl Host,
         instant: u64,
-        in_messages: &[MessageEnvelope],
+        opt_message: Option<MessageEnvelope>,
     ) -> Result<(), PalError> {
+        // Update state of the context that will remain unchanged while messages are
+        // dispatched for processing.
         self.preset_state_machine(instant);
 
-        for serialized_message in in_messages {
+        // Dispatch incoming message for processing.
+        if let Some(serialized_message) = opt_message {
             let deserialized_message =
                 EnvelopeIn::decode(serialized_message.as_ref()).map_err(|_e| PalError::Decoding)?;
             let message = deserialized_message.msg.ok_or(PalError::UnknownMessage)?;
@@ -733,9 +739,13 @@ impl Application for Driver {
             }?;
         }
 
+        // Collect outpus like messages, log entries and proposals from the actor.
         self.process_actor_output();
 
+        // Advance the raft amd collect results messages.
         let out_messages = self.process_state_machine()?;
+
+        // Send messages to raft peers and consumers through the trusted host.
         self.send_messages(host, out_messages);
 
         Ok(())
