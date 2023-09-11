@@ -271,6 +271,8 @@ impl FakeCluster {
             platform.advance_time(self.advance_step);
             platform.send_messages_in();
         }
+
+        self.print_log_messages();
     }
 
     fn extract_pull_messages(
@@ -289,6 +291,16 @@ impl FakeCluster {
         }
 
         result
+    }
+
+    fn print_log_messages(&mut self) {
+        let _ = self.extract_pull_messages(&mut |envelope_out| match &envelope_out.msg {
+            Some(envelope_out::Msg::Log(log_message)) => {
+                println!("{}", log_message.message);
+                true
+            }
+            _ => false,
+        });
     }
 
     fn stop(&mut self) {}

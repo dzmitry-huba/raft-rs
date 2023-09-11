@@ -4,8 +4,8 @@ use crate::endpoint::{
     ExecuteProposalResponse, LogMessage, LogSeverity, StartNodeRequest, StartNodeResponse,
     StopNodeRequest,
 };
+use crate::logger::{log::create_remote_logger, DrainOutput};
 use crate::model::{Actor, ActorContext, Severity};
-use crate::util::log::create_logger;
 use crate::util::raft::{
     create_raft_config_change, deserialize_config_change, deserialize_raft_message, get_conf_state,
     serialize_raft_message,
@@ -194,6 +194,7 @@ pub struct Driver {
     instant: u64,
     tick_instant: u64,
     logger: Logger,
+    logger_output: Box<dyn DrainOutput>,
     raft_node: Option<Box<RaftNode>>,
     raft_state: RaftState,
     prev_raft_state: RaftState,
@@ -201,6 +202,7 @@ pub struct Driver {
 
 impl Driver {
     pub fn new(driver_config: DriverConfig, actor: Box<dyn Actor>) -> Self {
+        let (logger, logger_output) = create_remote_logger(0);
         Driver {
             core: Rc::new(RefCell::new(DriverContextCore::new())),
             actor,
@@ -210,7 +212,8 @@ impl Driver {
             raft_node_id: 0,
             instant: 0,
             tick_instant: 0,
-            logger: create_logger(0),
+            logger,
+            logger_output,
             raft_node: None,
             raft_state: RaftState::new(),
             prev_raft_state: RaftState::new(),
@@ -538,7 +541,7 @@ impl Driver {
         let id = node_id_hint;
         self.mut_core().set_immutable_state(id, app_config);
         self.raft_node_id = id;
-        self.logger = create_logger(self.raft_node_id);
+        (self.logger, self.logger_output) = create_remote_logger(self.raft_node_id);
     }
 
     fn process_start_node(
@@ -651,6 +654,14 @@ impl Driver {
         }
     }
 
+    fn collect_log_entries(&mut self) {
+        for log_message in self.logger_output.take_entries() {
+            self.send_message(EnvelopeOut {
+                msg: Some(envelope_out::Msg::Log(log_message)),
+            });
+        }
+    }
+
     fn process_state_machine(&mut self) -> Result<Vec<EnvelopeOut>, PalError> {
         if self.raft_node.is_some() {
             // Advance raft internal state.
@@ -662,6 +673,8 @@ impl Driver {
             // If the leader state has changed send it out for observability.
             self.send_leader_state();
         }
+
+        self.collect_log_entries();
 
         // Take messages to be sent out.
         Ok(mem::take(&mut self.messages))

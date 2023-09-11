@@ -14,6 +14,7 @@ pub mod endpoint {
 }
 
 pub mod driver;
+pub mod logger;
 pub mod model;
 pub mod platform;
 pub mod util;

@@ -6,7 +6,6 @@ use raft::eraftpb::{
     ConfChange as RaftConfigChange, ConfChangeType as RaftConfigChangeType,
     ConfState as RaftConfState, Message as RaftMessage, Snapshot as RaftSnapshot,
 };
-use slog::{o, Logger};
 
 #[derive(Debug)]
 pub enum UtilError {
@@ -26,31 +25,6 @@ impl fmt::Display for UtilError {
             UtilError::Decoding => write!(f, "Failed to decode"),
             UtilError::Encoding => write!(f, "Failed to encode"),
         }
-    }
-}
-
-#[cfg(feature = "std")]
-pub mod log {
-    extern crate slog_term;
-    use super::*;
-    use slog::Drain;
-
-    pub fn create_logger(node_id: u64) -> Logger {
-        let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
-        Logger::root(
-            slog_term::FullFormat::new(plain).build().fuse(),
-            o!("raft_id" => format!("{}", node_id)),
-        )
-    }
-}
-
-#[cfg(not(feature = "std"))]
-pub mod log {
-    use super::*;
-    use slog::Discard;
-
-    pub fn create_logger(_node_id: u64) -> Logger {
-        Logger::root(Discard, o!())
     }
 }
 
