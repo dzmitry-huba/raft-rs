@@ -35,6 +35,7 @@ pub enum PalError {
     InvalidArgument,
     InvalidOperation,
     Internal,
+    Actor,
 }
 
 impl StdError for PalError {
@@ -52,6 +53,7 @@ impl fmt::Display for PalError {
             PalError::InvalidArgument => write!(f, "Invalid argument"),
             PalError::InvalidOperation => write!(f, "Invalid argument"),
             PalError::Internal => write!(f, "Intern error"),
+            PalError::Actor => write!(f, "Actor error"),
         }
     }
 }

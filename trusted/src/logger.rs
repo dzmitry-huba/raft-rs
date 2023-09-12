@@ -125,7 +125,7 @@ pub mod log {
         (
             Logger::root(
                 Mutex::new(drain).fuse(),
-                o!("raft_id" => format!("{}", node_id)),
+                o!("type" => format!("raft #{}", node_id)),
             ),
             Box::new(remote_drain_core),
         )
@@ -206,7 +206,10 @@ pub mod log {
         let remote_drain = RemoteDrain::new(remote_drain_core.clone());
 
         (
-            Logger::root(Fuse(remote_drain), o!("raft_id" => format!("{}", node_id))),
+            Logger::root(
+                Fuse(remote_drain),
+                o!("type" => format!("raft #{}", node_id)),
+            ),
             Box::new(remote_drain_core),
         )
     }

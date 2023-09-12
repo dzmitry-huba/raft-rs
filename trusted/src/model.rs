@@ -6,10 +6,16 @@ use core::option::Option;
 use core::result::Result;
 use slog::Logger;
 
+/// Enumerates actor induced errors. Note that all errors indicate that
+/// actor cannot continue to operate and must be terminated.
 #[derive(Debug)]
 pub enum ActorError {
-    Decoding,
+    /// An internal error.
     Internal,
+    /// Failed to load actor configuration.
+    ConfigLoading,
+    /// Failed to load serialized actor snapshot.
+    SnapshotLoading,
 }
 
 impl StdError for ActorError {
@@ -21,8 +27,9 @@ impl StdError for ActorError {
 impl fmt::Display for ActorError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ActorError::Decoding => write!(f, "Failed to decode"),
             ActorError::Internal => write!(f, "Intern error"),
+            ActorError::ConfigLoading => write!(f, "Failed to load config"),
+            ActorError::SnapshotLoading => write!(f, "Failed to load snapshot"),
         }
     }
 }

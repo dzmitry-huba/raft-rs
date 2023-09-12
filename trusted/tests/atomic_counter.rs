@@ -21,7 +21,7 @@ use alloc::string::String;
 use core::cell::RefCell;
 use hashbrown::HashMap;
 use prost::Message;
-use slog::info;
+use slog::{debug, warn};
 use trusted::{
     driver::{Driver, DriverConfig},
     endpoint::*,
@@ -43,7 +43,10 @@ impl CounterActor {
     }
 
     fn get_context(&mut self) -> &mut dyn ActorContext {
-        self.context.as_mut().expect("context").as_mut()
+        self.context
+            .as_mut()
+            .expect("Context is initialized")
+            .as_mut()
     }
 
     fn send_message<M: Message>(&mut self, message: &M) {
@@ -56,9 +59,9 @@ impl CounterActor {
         counter_name: &String,
         compare_and_swap_request: &CounterCompareAndSwapRequest,
     ) -> CounterResponse {
-        info!(
+        debug!(
             self.get_context().get_logger(),
-            "Applying #{} compare and swap", id
+            "Applying #{} compare and swap command {:?}", id, compare_and_swap_request
         );
 
         let mut response = CounterResponse {
@@ -93,8 +96,10 @@ impl Actor for CounterActor {
     fn on_init(&mut self, context: Box<dyn ActorContext>) -> Result<(), ActorError> {
         self.context = Some(context);
         self.values = HashMap::new();
+
         let config = CounterConfig::decode(self.get_context().get_config().as_ref())
-            .map_err(|_e| ActorError::Decoding)?;
+            .map_err(|_| ActorError::ConfigLoading)?;
+
         for (counter_name, counter_value) in config.initial_values {
             self.values.insert(counter_name, counter_value);
         }
@@ -108,6 +113,7 @@ impl Actor for CounterActor {
         let mut snapshot = CounterSnapshot {
             values: BTreeMap::new(),
         };
+
         for (counter_name, counter_value) in &self.values {
             snapshot
                 .values
@@ -118,7 +124,9 @@ impl Actor for CounterActor {
     }
 
     fn on_load_snapshot(&mut self, snapshot: &[u8]) -> Result<(), ActorError> {
-        let snapshot = CounterSnapshot::decode(snapshot).map_err(|_e| ActorError::Decoding)?;
+        let snapshot =
+            CounterSnapshot::decode(snapshot).map_err(|_| ActorError::SnapshotLoading)?;
+
         for (counter_name, counter_value) in snapshot.values {
             self.values.insert(counter_name, counter_value);
         }
@@ -127,36 +135,53 @@ impl Actor for CounterActor {
     }
 
     fn on_process_command(&mut self, command: &[u8]) -> Result<(), ActorError> {
-        let request = CounterRequest::decode(command).map_err(|_e| ActorError::Decoding)?;
-        info!(
-            self.get_context().get_logger(),
-            "Processing #{} command", request.id
-        );
+        if let Ok(request) = CounterRequest::decode(command) {
+            debug!(
+                self.get_context().get_logger(),
+                "Processing #{} command", request.id
+            );
 
-        let mut response = CounterResponse {
-            id: request.id,
-            ..Default::default()
-        };
-        let mut status = CounterStatus::Success;
-        if request.op.is_none() {
-            status = CounterStatus::InvalidArgumentError;
-        }
-        if !self.get_context().is_leader() {
-            status = CounterStatus::NotLeaderError;
-        }
+            let mut response = CounterResponse {
+                id: request.id,
+                ..Default::default()
+            };
+            let mut status = CounterStatus::Success;
+            if request.op.is_none() {
+                status = CounterStatus::InvalidArgumentError;
 
-        if let CounterStatus::Success = status {
-            self.get_context().propose_event(command.to_vec())?;
+                warn!(
+                    self.get_context().get_logger(),
+                    "Rejecting #{} command: unknown op", request.id
+                );
+            }
+            if !self.get_context().is_leader() {
+                status = CounterStatus::NotLeaderError;
+
+                warn!(
+                    self.get_context().get_logger(),
+                    "Rejecting #{} command: not a leader", request.id
+                );
+            }
+
+            if let CounterStatus::Success = status {
+                self.get_context().propose_event(command.to_vec())?;
+            } else {
+                response.status = status.into();
+                self.send_message(&response);
+            }
         } else {
-            response.status = status.into();
-            self.send_message(&response);
+            warn!(
+                self.get_context().get_logger(),
+                "Rejecting command: failed to decode"
+            );
         }
 
         Ok(())
     }
 
     fn on_apply_event(&mut self, _index: u64, event: &[u8]) -> Result<(), ActorError> {
-        let request = CounterRequest::decode(event).map_err(|_e| ActorError::Decoding)?;
+        let request = CounterRequest::decode(event).map_err(|_| ActorError::Internal)?;
+
         let op = request.op.unwrap();
 
         let response = match op {
@@ -164,6 +189,7 @@ impl Actor for CounterActor {
                 self.apply_compare_and_swap(request.id, &request.name, compare_and_swap_request)
             }
         };
+
         if self.get_context().is_leader() {
             self.send_message(&response);
         }

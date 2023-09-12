@@ -346,7 +346,15 @@ impl Driver {
                 // Pass committed entry to the actor to make effective.
                 self.actor
                     .on_apply_event(committed_entry.index, committed_entry.get_data())
-                    .map_err(|_e| PalError::Internal)?;
+                    .map_err(|e| {
+                        error!(
+                            self.logger,
+                            "Failed to apply committed event to actor state: {}", e
+                        );
+
+                        // Failure to apply committed event to actor state must lead to termination.
+                        PalError::Actor
+                    })?;
             }
         }
 
@@ -380,7 +388,7 @@ impl Driver {
             return Ok(());
         }
 
-        info!(self.logger, "Restroing raft snappshot");
+        info!(self.logger, "Restoring raft snappshot");
 
         self.collect_config_state(get_conf_state(raft_snapshot));
 
@@ -394,7 +402,12 @@ impl Driver {
         // Pass snapshot to the actor to restore.
         self.actor
             .on_load_snapshot(raft_snapshot.get_data())
-            .map_err(|_e| PalError::Internal)?;
+            .map_err(|e| {
+                error!(self.logger, "Failed to load actor state snapshot: {}", e);
+
+                // Failure to load actor snapshot must lead to termination.
+                PalError::Actor
+            })?;
 
         Ok(())
     }
@@ -551,12 +564,15 @@ impl Driver {
 
         let actor_context = Box::new(DriverContext::new(
             Rc::clone(&self.core),
-            self.logger.new(o!("actor" => "")),
+            self.logger.new(o!("type" => "actor")),
         ));
 
-        self.actor
-            .on_init(actor_context)
-            .map_err(|_e| PalError::Internal)?;
+        self.actor.on_init(actor_context).map_err(|e| {
+            error!(self.logger, "Failed to initialize actor: {}", e);
+
+            // Failure to initialize actor must lead to termination.
+            PalError::Actor
+        })?;
 
         self.driver_state = DriverState::Started;
 
@@ -635,7 +651,12 @@ impl Driver {
 
         self.actor
             .on_process_command(execute_proposal_request.proposal_contents.as_ref())
-            .map_err(|_e| PalError::Internal)?;
+            .map_err(|e| {
+                error!(self.logger, "Failed to process actor command: {}", e);
+
+                // Failure to process actor command must lead to termination.
+                PalError::Actor
+            })?;
 
         Ok(())
     }
