@@ -4,6 +4,7 @@ extern crate alloc;
 extern crate core;
 extern crate hashbrown;
 extern crate prost;
+extern crate slog;
 extern crate trusted;
 
 pub mod counter {
@@ -20,6 +21,7 @@ use alloc::string::String;
 use core::cell::RefCell;
 use hashbrown::HashMap;
 use prost::Message;
+use slog::info;
 use trusted::{
     driver::{Driver, DriverConfig},
     endpoint::*,
@@ -54,6 +56,11 @@ impl CounterActor {
         counter_name: &String,
         compare_and_swap_request: &CounterCompareAndSwapRequest,
     ) -> CounterResponse {
+        info!(
+            self.get_context().get_logger(),
+            "Applying #{} compare and swap", id
+        );
+
         let mut response = CounterResponse {
             id,
             status: CounterStatus::Unspecified.into(),
@@ -121,6 +128,11 @@ impl Actor for CounterActor {
 
     fn on_process_command(&mut self, command: &[u8]) -> Result<(), ActorError> {
         let request = CounterRequest::decode(command).map_err(|_e| ActorError::Decoding)?;
+        info!(
+            self.get_context().get_logger(),
+            "Processing #{} command", request.id
+        );
+
         let mut response = CounterResponse {
             id: request.id,
             ..Default::default()

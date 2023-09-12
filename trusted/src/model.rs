@@ -1,10 +1,10 @@
 use crate::StdError;
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::option::Option;
 use core::result::Result;
+use slog::Logger;
 
 #[derive(Debug)]
 pub enum ActorError {
@@ -27,15 +27,12 @@ impl fmt::Display for ActorError {
     }
 }
 
-pub enum Severity {
-    Info,
-    Warning,
-    Error,
-}
-
 /// Represents an actor context that acts as a accessor for the underlying
 /// consensus module and the trusted host.
 pub trait ActorContext {
+    /// Gets logger to send entries through the trusted host to the untrusted launcher.
+    fn get_logger(&self) -> &Logger;
+
     /// Gets the identity of the underyling consensus module node in the consensus
     /// cluster.
     fn get_id(&self) -> u64;
@@ -62,9 +59,6 @@ pub trait ActorContext {
 
     /// Sends message through the trusted host to the untrusted launcher.
     fn send_message(&mut self, message: Vec<u8>);
-
-    /// Logs entry through the trusted host to the untrusted launcher.
-    fn log_entry(&mut self, severity: Severity, message: String);
 }
 
 /// Represents a stateful actor backed by replicated state machine.

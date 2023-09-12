@@ -42,7 +42,7 @@ fn create_log_message(record: &slog::Record, values: &slog::OwnedKVList) -> LogM
     values.serialize(record, &mut value_serializer).unwrap();
 
     let message = format!(
-        "{:?} {}@{}:{}/{} /{}",
+        "{:?} {} @ {} : {} / {} / {}",
         record.level(),
         record.file(),
         record.line(),

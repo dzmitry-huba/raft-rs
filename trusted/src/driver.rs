@@ -1,19 +1,12 @@
-use crate::endpoint::{
-    envelope_in, envelope_out, ChangeClusterRequest, ChangeClusterType, CheckClusterRequest,
-    CheckClusterResponse, DeliverMessage, EnvelopeIn, EnvelopeOut, ExecuteProposalRequest,
-    ExecuteProposalResponse, LogMessage, LogSeverity, StartNodeRequest, StartNodeResponse,
-    StopNodeRequest,
-};
+use crate::endpoint::*;
 use crate::logger::{log::create_remote_logger, DrainOutput};
-use crate::model::{Actor, ActorContext, Severity};
+use crate::model::{Actor, ActorContext};
 use crate::util::raft::{
     create_raft_config_change, deserialize_config_change, deserialize_raft_message, get_conf_state,
     serialize_raft_message,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -29,7 +22,7 @@ use raft::{
     eraftpb::Message as RaftMessage, eraftpb::Snapshot as RaftSnapshot, storage::MemStorage,
     Config as RaftConfig, RawNode, StateRole as RaftStateRole,
 };
-use slog::{info, Logger};
+use slog::{debug, error, info, o, Logger};
 type RaftNode = RawNode<MemStorage>;
 
 struct DriverContextCore {
@@ -97,15 +90,20 @@ impl DriverContextCore {
 
 struct DriverContext {
     core: Rc<RefCell<DriverContextCore>>,
+    logger: Logger,
 }
 
 impl DriverContext {
-    fn new(core: Rc<RefCell<DriverContextCore>>) -> Self {
-        DriverContext { core }
+    fn new(core: Rc<RefCell<DriverContextCore>>, logger: Logger) -> Self {
+        DriverContext { core, logger }
     }
 }
 
 impl ActorContext for DriverContext {
+    fn get_logger(&self) -> &Logger {
+        &self.logger
+    }
+
     fn get_id(&self) -> u64 {
         self.core.borrow().get_id()
     }
@@ -137,23 +135,9 @@ impl ActorContext for DriverContext {
             )),
         });
     }
-
-    fn log_entry(&mut self, severity: Severity, message: String) {
-        let log_severity = match severity {
-            Severity::Info => LogSeverity::Info,
-            Severity::Warning => LogSeverity::Warning,
-            Severity::Error => LogSeverity::Error,
-        };
-
-        self.core.borrow_mut().append_message(EnvelopeOut {
-            msg: Some(envelope_out::Msg::Log(LogMessage {
-                severity: log_severity.into(),
-                message,
-            })),
-        });
-    }
 }
 
+#[derive(PartialEq, Eq)]
 enum DriverState {
     Created,
     Started,
@@ -278,7 +262,7 @@ impl Driver {
     ) {
         let message = deserialize_raft_message(message_contents).unwrap();
 
-        info!(self.logger, "Making raft step");
+        debug!(self.logger, "Making raft step");
 
         if self.raft_node_id != recipient_node_id {
             // Ignore incorrectly routed message
@@ -294,7 +278,7 @@ impl Driver {
     }
 
     fn make_raft_proposal(&mut self, proposal_contents: Vec<u8>) {
-        info!(self.logger, "Making raft proposal");
+        debug!(self.logger, "Making raft proposal");
 
         self.mut_raft_node()
             .propose(vec![], proposal_contents)
@@ -306,7 +290,7 @@ impl Driver {
         node_id: u64,
         change_type: RaftConfigChangeType,
     ) {
-        info!(self.logger, "Making raft config change proposal");
+        debug!(self.logger, "Making raft config change proposal");
 
         let config_change = create_raft_config_change(node_id, change_type);
         self.mut_raft_node()
@@ -319,9 +303,9 @@ impl Driver {
         // pass between driver invocation we may need to produce multiple ticks.
         while self.instant - self.tick_instant >= self.driver_config.tick_period {
             self.tick_instant += self.driver_config.tick_period;
-            info!(
+            debug!(
                 self.logger,
-                "Triggerign raft tick at {i}",
+                "Triggering raft tick at {i}",
                 i = self.tick_instant
             );
             // invoke raft tick to trigger timer based changes.
@@ -348,7 +332,7 @@ impl Driver {
                     .apply_conf_change(&config_change)
                     .unwrap();
 
-                info!(self.logger, "Applying raft config change entry");
+                debug!(self.logger, "Applying raft config change entry");
 
                 self.collect_config_state(&config_state);
 
@@ -357,7 +341,7 @@ impl Driver {
                     .wl()
                     .set_conf_state(config_state);
             } else {
-                info!(self.logger, "Applying raft entry");
+                debug!(self.logger, "Applying raft entry");
 
                 // Pass committed entry to the actor to make effective.
                 self.actor
@@ -370,7 +354,7 @@ impl Driver {
     }
 
     fn send_raft_messages(&mut self, raft_messages: Vec<RaftMessage>) -> Result<(), PalError> {
-        info!(
+        debug!(
             self.logger,
             "Sending {msg_count} raft messages",
             msg_count = raft_messages.len()
@@ -431,12 +415,12 @@ impl Driver {
         self.trigger_raft_tick();
 
         if !self.raft_node().has_ready() {
-            info!(self.logger, "No raft ready to process");
+            debug!(self.logger, "No raft ready to process");
             // There is nothing process.
             return Ok(());
         }
 
-        info!(self.logger, "Processing raft ready");
+        debug!(self.logger, "Processing raft ready");
 
         let mut raft_ready = self.mut_raft_node().ready();
 
@@ -529,15 +513,24 @@ impl Driver {
         self.mut_core().set_state(instant, leader);
     }
 
-    fn check_started(&self) -> Result<(), PalError> {
-        let DriverState::Started = self.driver_state else {
+    fn check_driver_state(&self, state: DriverState) -> Result<(), PalError> {
+        if self.driver_state != state {
             return Err(PalError::InvalidOperation);
-        };
+        }
 
         Ok(())
     }
 
-    fn process_init(&mut self, app_config: Vec<u8>, _app_signing_key: Vec<u8>, node_id_hint: u64) {
+    fn check_driver_started(&self) -> Result<(), PalError> {
+        self.check_driver_state(DriverState::Started)
+    }
+
+    fn initialize_driver(
+        &mut self,
+        app_config: Vec<u8>,
+        _app_signing_key: Vec<u8>,
+        node_id_hint: u64,
+    ) {
         let id = node_id_hint;
         self.mut_core().set_immutable_state(id, app_config);
         self.raft_node_id = id;
@@ -547,13 +540,19 @@ impl Driver {
     fn process_start_node(
         &mut self,
         start_node_request: &StartNodeRequest,
-        actor_context: Box<dyn ActorContext>,
+        app_config: Vec<u8>,
+        app_signing_key: Vec<u8>,
     ) -> Result<(), PalError> {
-        let DriverState::Created = self.driver_state else {
-            return Err(PalError::InvalidOperation);
-        };
+        self.check_driver_state(DriverState::Created)?;
+
+        self.initialize_driver(app_config, app_signing_key, start_node_request.node_id_hint);
 
         self.initilize_raft_node(start_node_request.is_leader)?;
+
+        let actor_context = Box::new(DriverContext::new(
+            Rc::clone(&self.core),
+            self.logger.new(o!("actor" => "")),
+        ));
 
         self.actor
             .on_init(actor_context)
@@ -586,14 +585,13 @@ impl Driver {
         &mut self,
         change_cluster_request: &ChangeClusterRequest,
     ) -> Result<(), PalError> {
-        self.check_started()?;
+        self.check_driver_started()?;
 
         let change_type = match ChangeClusterType::from_i32(change_cluster_request.change_type) {
             Some(ChangeClusterType::ChangeTypeAddNode) => RaftConfigChangeType::AddNode,
             Some(ChangeClusterType::ChangeTypeRemoveNode) => RaftConfigChangeType::RemoveNode,
             _ => {
-                self.log_entry(Severity::Error, "Unknown cluster change".to_string());
-
+                error!(self.logger, "Unknown cluster change command");
                 return Ok(());
             }
         };
@@ -607,7 +605,7 @@ impl Driver {
         &mut self,
         _check_cluster_request: &CheckClusterRequest,
     ) -> Result<(), PalError> {
-        self.check_started()?;
+        self.check_driver_started()?;
 
         self.reset_leader_state();
 
@@ -618,7 +616,7 @@ impl Driver {
         &mut self,
         deliver_message: &DeliverMessage,
     ) -> Result<(), PalError> {
-        self.check_started()?;
+        self.check_driver_started()?;
 
         self.make_raft_step(
             deliver_message.sender_node_id,
@@ -633,7 +631,7 @@ impl Driver {
         &mut self,
         execute_proposal_request: &ExecuteProposalRequest,
     ) -> Result<(), PalError> {
-        self.check_started()?;
+        self.check_driver_started()?;
 
         self.actor
             .on_process_command(execute_proposal_request.proposal_contents.as_ref())
@@ -654,14 +652,6 @@ impl Driver {
         }
     }
 
-    fn collect_log_entries(&mut self) {
-        for log_message in self.logger_output.take_entries() {
-            self.send_message(EnvelopeOut {
-                msg: Some(envelope_out::Msg::Log(log_message)),
-            });
-        }
-    }
-
     fn process_state_machine(&mut self) -> Result<Vec<EnvelopeOut>, PalError> {
         if self.raft_node.is_some() {
             // Advance raft internal state.
@@ -674,7 +664,7 @@ impl Driver {
             self.send_leader_state();
         }
 
-        self.collect_log_entries();
+        self.send_log_entries();
 
         // Take messages to be sent out.
         Ok(mem::take(&mut self.messages))
@@ -684,23 +674,16 @@ impl Driver {
         self.raft_node_id
     }
 
-    fn send_message(&mut self, message: EnvelopeOut) {
-        self.messages.push(message);
+    fn send_log_entries(&mut self) {
+        for log_message in self.logger_output.take_entries() {
+            self.send_message(EnvelopeOut {
+                msg: Some(envelope_out::Msg::Log(log_message)),
+            });
+        }
     }
 
-    fn log_entry(&mut self, severity: Severity, message: String) {
-        let log_severity = match severity {
-            Severity::Info => LogSeverity::Info,
-            Severity::Warning => LogSeverity::Warning,
-            Severity::Error => LogSeverity::Error,
-        };
-
-        self.send_message(EnvelopeOut {
-            msg: Some(envelope_out::Msg::Log(LogMessage {
-                severity: log_severity.into(),
-                message,
-            })),
-        });
+    fn send_message(&mut self, message: EnvelopeOut) {
+        self.messages.push(message);
     }
 }
 
@@ -723,17 +706,11 @@ impl Application for Driver {
             let message = deserialized_message.msg.ok_or(PalError::UnknownMessage)?;
 
             match message {
-                envelope_in::Msg::StartNode(ref start_node_request) => {
-                    let actor_context = Box::new(DriverContext::new(Rc::clone(&self.core)));
-
-                    self.process_init(
-                        host.get_self_config(),
-                        host.get_self_attestation().public_signing_key(),
-                        start_node_request.node_id_hint,
-                    );
-
-                    self.process_start_node(start_node_request, actor_context)
-                }
+                envelope_in::Msg::StartNode(ref start_node_request) => self.process_start_node(
+                    start_node_request,
+                    host.get_self_config(),
+                    host.get_self_attestation().public_signing_key(),
+                ),
                 envelope_in::Msg::StopNode(ref stop_node_request) => {
                     self.process_stop_node(stop_node_request)
                 }
