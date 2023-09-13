@@ -523,13 +523,11 @@ impl Host for FakeHost {
         self.config.clone()
     }
 
-    fn send_messages(&mut self, messages: &[MessageEnvelope]) -> Result<(), PalError> {
+    fn send_messages(&mut self, messages: &[MessageEnvelope]) {
         for message_envelope in messages {
             self.messages_out
                 .push(EnvelopeOut::decode(message_envelope.as_ref()).unwrap());
         }
-
-        Ok(())
     }
 
     fn verify_peer_attestation(

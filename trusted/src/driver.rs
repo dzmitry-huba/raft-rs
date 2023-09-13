@@ -281,8 +281,6 @@ impl Driver {
                 Ok(())
             }
             Ok(message) => {
-                debug!(self.logger, "Making Raft step");
-
                 if self.raft_node_id != recipient_node_id {
                     // Ignore incorrectly routed message
                     warn!(
@@ -353,11 +351,6 @@ impl Driver {
         // pass between driver invocation we may need to produce multiple ticks.
         while self.instant - self.tick_instant >= self.driver_config.tick_period {
             self.tick_instant += self.driver_config.tick_period;
-            debug!(
-                self.logger,
-                "Triggering Raft tick at {i}",
-                i = self.tick_instant
-            );
             // invoke Raft tick to trigger timer based changes.
             self.mut_raft_node().tick();
         }
@@ -378,7 +371,18 @@ impl Driver {
                 debug!(self.logger, "Applying Raft config change entry");
 
                 // Make committed configuration effective.
-                let config_change = deserialize_config_change(&committed_entry.data).unwrap();
+                let config_change = match deserialize_config_change(&committed_entry.data) {
+                    Ok(config_change) => config_change,
+                    Err(e) => {
+                        error!(
+                            self.logger,
+                            "Failed to deserialize Raft config change: {}", e
+                        );
+                        // Failure to deserialize Raft config change must lead to termination.
+                        return Err(PalError::Raft);
+                    }
+                };
+
                 match self.mut_raft_node().apply_conf_change(&config_change) {
                     Err(e) => {
                         error!(self.logger, "Failed to apply Raft config change: {}", e);
@@ -415,12 +419,6 @@ impl Driver {
     }
 
     fn send_raft_messages(&mut self, raft_messages: Vec<RaftMessage>) -> Result<(), PalError> {
-        debug!(
-            self.logger,
-            "Sending {msg_count} Raft messages",
-            msg_count = raft_messages.len()
-        );
-
         for raft_message in raft_messages {
             // Buffer message to be sent out.
             self.stash_message(envelope_out::Msg::DeliverMessage(DeliverMessage {
@@ -444,18 +442,25 @@ impl Driver {
         self.collect_config_state(get_conf_state(raft_snapshot));
 
         // Persist unstable snapshot received from a peer into the stable storage.
-        self.mut_raft_node()
+        let apply_result = self
+            .mut_raft_node()
             .store()
             .wl()
-            .apply_snapshot(raft_snapshot.clone())
-            .unwrap();
+            .apply_snapshot(raft_snapshot.clone());
+        if let Err(e) = apply_result {
+            error!(
+                self.logger,
+                "Failed to apply Raft snapshot to storage: {}", e
+            );
+            // Failure to apply Raft snapshot to storage snapshot must lead to termination.
+            return Err(PalError::Raft);
+        }
 
         // Pass snapshot to the actor to restore.
         self.actor
             .on_load_snapshot(raft_snapshot.get_data())
             .map_err(|e| {
                 error!(self.logger, "Failed to load actor state snapshot: {}", e);
-
                 // Failure to load actor snapshot must lead to termination.
                 PalError::Actor
             })?;
@@ -464,10 +469,11 @@ impl Driver {
     }
 
     fn maybe_create_raft_snapshot(&mut self) -> Result<(), PalError> {
-        let _actor_snapshot = self
-            .actor
-            .on_save_snapshot()
-            .map_err(|_e| PalError::Internal)?;
+        let _actor_snapshot = self.actor.on_save_snapshot().map_err(|e| {
+            error!(self.logger, "Failed to save actor state to snapshot: {}", e);
+            // Failure to apply Raft snapshot to storage snapshot must lead to termination.
+            PalError::Actor
+        })?;
 
         // todo!()
 
@@ -479,12 +485,9 @@ impl Driver {
         self.trigger_raft_tick();
 
         if !self.raft_node().has_ready() {
-            debug!(self.logger, "No Raft ready to process");
             // There is nothing process.
             return Ok(());
         }
-
-        debug!(self.logger, "Processing Raft ready");
 
         let mut raft_ready = self.mut_raft_node().ready();
 
@@ -511,11 +514,19 @@ impl Driver {
 
         if !raft_ready.entries().is_empty() {
             // Persist unstable entries into the stable storage.
-            self.mut_raft_node()
+            let append_result = self
+                .mut_raft_node()
                 .store()
                 .wl()
-                .append(raft_ready.entries())
-                .map_err(|_e| PalError::Internal)?;
+                .append(raft_ready.entries());
+            if let Err(e) = append_result {
+                error!(
+                    self.logger,
+                    "Failed to append Raft entries to storage: {}", e
+                );
+                // Failure to append Raft entries to storage snapshot must lead to termination.
+                return Err(PalError::Actor);
+            }
         }
 
         // Advance Raft state after fully processing ready.
@@ -764,7 +775,7 @@ impl Driver {
             serialized_out_messages.push(out_message.encode_to_vec());
         }
 
-        host.send_messages(&serialized_out_messages).unwrap();
+        host.send_messages(&serialized_out_messages);
     }
 }
 

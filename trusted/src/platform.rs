@@ -155,10 +155,10 @@ pub trait Host {
     ///
     /// * `messages` - A set of messsages to send through the channel.
     ///
-    /// # Returns
+    /// # Panics
     ///
-    /// Error if the communication channel is irrepairably broken, a success otherise.
-    fn send_messages(&mut self, messages: &[MessageEnvelope]) -> Result<(), PalError>;
+    /// If the communication channel is irrepairably broken, a success otherise.
+    fn send_messages(&mut self, messages: &[MessageEnvelope]);
 
     /// Attempts to deserialize peer attestation and perform initial verification
     /// of the attestation. The application specific verification (e.g. ensuring
