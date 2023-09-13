@@ -60,7 +60,7 @@ impl CounterActor {
         compare_and_swap_request: &CounterCompareAndSwapRequest,
     ) -> CounterResponse {
         debug!(
-            self.get_context().get_logger(),
+            self.get_context().logger(),
             "Applying #{} compare and swap command {:?}", id, compare_and_swap_request
         );
 
@@ -97,7 +97,7 @@ impl Actor for CounterActor {
         self.context = Some(context);
         self.values = HashMap::new();
 
-        let config = CounterConfig::decode(self.get_context().get_config().as_ref())
+        let config = CounterConfig::decode(self.get_context().config().as_ref())
             .map_err(|_| ActorError::ConfigLoading)?;
 
         for (counter_name, counter_value) in config.initial_values {
@@ -135,45 +135,45 @@ impl Actor for CounterActor {
     }
 
     fn on_process_command(&mut self, command: &[u8]) -> Result<(), ActorError> {
-        if let Ok(request) = CounterRequest::decode(command) {
-            debug!(
-                self.get_context().get_logger(),
-                "Processing #{} command", request.id
-            );
-
-            let mut response = CounterResponse {
-                id: request.id,
-                ..Default::default()
-            };
-            let mut status = CounterStatus::Success;
-            if request.op.is_none() {
-                status = CounterStatus::InvalidArgumentError;
-
-                warn!(
-                    self.get_context().get_logger(),
-                    "Rejecting #{} command: unknown op", request.id
+        match CounterRequest::decode(command) {
+            Ok(request) => {
+                debug!(
+                    self.get_context().logger(),
+                    "Processing #{} command", request.id
                 );
-            }
-            if !self.get_context().is_leader() {
-                status = CounterStatus::NotLeaderError;
 
-                warn!(
-                    self.get_context().get_logger(),
-                    "Rejecting #{} command: not a leader", request.id
-                );
-            }
+                let mut response = CounterResponse {
+                    id: request.id,
+                    ..Default::default()
+                };
+                let mut status = CounterStatus::Success;
+                if request.op.is_none() {
+                    status = CounterStatus::InvalidArgumentError;
 
-            if let CounterStatus::Success = status {
-                self.get_context().propose_event(command.to_vec())?;
-            } else {
-                response.status = status.into();
-                self.send_message(&response);
+                    warn!(
+                        self.get_context().logger(),
+                        "Rejecting #{} command: unknown op", request.id
+                    );
+                }
+                if !self.get_context().leader() {
+                    status = CounterStatus::NotLeaderError;
+
+                    warn!(
+                        self.get_context().logger(),
+                        "Rejecting #{} command: not a leader", request.id
+                    );
+                }
+
+                if let CounterStatus::Success = status {
+                    self.get_context().propose_event(command.to_vec())?;
+                } else {
+                    response.status = status.into();
+                    self.send_message(&response);
+                }
             }
-        } else {
-            warn!(
-                self.get_context().get_logger(),
-                "Rejecting command: failed to decode"
-            );
+            Err(e) => {
+                warn!(self.get_context().logger(), "Rejecting command: {}", e);
+            }
         }
 
         Ok(())
@@ -190,7 +190,7 @@ impl Actor for CounterActor {
             }
         };
 
-        if self.get_context().is_leader() {
+        if self.get_context().leader() {
             self.send_message(&response);
         }
 

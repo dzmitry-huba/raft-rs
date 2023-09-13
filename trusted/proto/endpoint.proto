@@ -59,6 +59,7 @@ message ChangeClusterRequest {
 }
 
 message ChangeClusterResponse {
+  uint64 change_id = 1;
   ChangeClusterStatus change_status = 2;
 }
 

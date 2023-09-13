@@ -31,10 +31,15 @@ pub type MessageEnvelope = Vec<u8>;
 pub enum PalError {
     Decoding,
     Encoding,
-    UnknownMessage,
     InvalidArgument,
+    //
     InvalidOperation,
+    //
+    Storage,
+    //
+    Raft,
     Internal,
+    // Actor experiences unrecoverable error and must be terminated.
     Actor,
 }
 
@@ -49,11 +54,12 @@ impl fmt::Display for PalError {
         match *self {
             PalError::Decoding => write!(f, "Failed to decode"),
             PalError::Encoding => write!(f, "Failed to encode"),
-            PalError::UnknownMessage => write!(f, "Unknown message"),
             PalError::InvalidArgument => write!(f, "Invalid argument"),
-            PalError::InvalidOperation => write!(f, "Invalid argument"),
+            PalError::InvalidOperation => write!(f, "Invalid operation"),
             PalError::Internal => write!(f, "Intern error"),
-            PalError::Actor => write!(f, "Actor error"),
+            PalError::Actor => write!(f, "Actor unrecoverable error"),
+            PalError::Storage => write!(f, "Storage unrecoverable error"),
+            PalError::Raft => write!(f, "Raft unrecoverable error"),
         }
     }
 }

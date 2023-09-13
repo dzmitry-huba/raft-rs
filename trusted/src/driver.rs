@@ -20,9 +20,9 @@ use raft::{
     eraftpb::ConfChangeType as RaftConfigChangeType, eraftpb::ConfState as RaftConfState,
     eraftpb::Entry as RaftEntry, eraftpb::EntryType as RaftEntryType, eraftpb::HardState,
     eraftpb::Message as RaftMessage, eraftpb::Snapshot as RaftSnapshot, storage::MemStorage,
-    Config as RaftConfig, RawNode, StateRole as RaftStateRole,
+    Config as RaftConfig, Error as RaftError, RawNode, StateRole as RaftStateRole,
 };
-use slog::{debug, error, info, o, Logger};
+use slog::{debug, error, info, o, warn, Logger};
 type RaftNode = RawNode<MemStorage>;
 
 struct DriverContextCore {
@@ -31,7 +31,7 @@ struct DriverContextCore {
     config: Vec<u8>,
     leader: bool,
     proposals: Vec<Vec<u8>>,
-    messages: Vec<EnvelopeOut>,
+    messages: Vec<envelope_out::Msg>,
 }
 
 impl DriverContextCore {
@@ -56,19 +56,19 @@ impl DriverContextCore {
         self.config = config;
     }
 
-    fn get_id(&self) -> u64 {
+    fn id(&self) -> u64 {
         self.id
     }
 
-    fn get_instant(&self) -> u64 {
+    fn instant(&self) -> u64 {
         self.instant
     }
 
-    fn get_leader(&self) -> bool {
+    fn leader(&self) -> bool {
         self.leader
     }
 
-    fn get_config(&self) -> Vec<u8> {
+    fn config(&self) -> Vec<u8> {
         self.config.clone()
     }
 
@@ -76,11 +76,11 @@ impl DriverContextCore {
         self.proposals.push(proposal);
     }
 
-    fn append_message(&mut self, message: EnvelopeOut) {
+    fn append_message(&mut self, message: envelope_out::Msg) {
         self.messages.push(message);
     }
 
-    fn take_outputs(&mut self) -> (Vec<Vec<u8>>, Vec<EnvelopeOut>) {
+    fn take_outputs(&mut self) -> (Vec<Vec<u8>>, Vec<envelope_out::Msg>) {
         (
             mem::take(&mut self.proposals),
             mem::take(&mut self.messages),
@@ -100,24 +100,24 @@ impl DriverContext {
 }
 
 impl ActorContext for DriverContext {
-    fn get_logger(&self) -> &Logger {
+    fn logger(&self) -> &Logger {
         &self.logger
     }
 
-    fn get_id(&self) -> u64 {
-        self.core.borrow().get_id()
+    fn id(&self) -> u64 {
+        self.core.borrow().id()
     }
 
-    fn get_instant(&self) -> u64 {
-        self.core.borrow().get_instant()
+    fn instant(&self) -> u64 {
+        self.core.borrow().instant()
     }
 
-    fn get_config(&self) -> Vec<u8> {
-        self.core.borrow().get_config()
+    fn config(&self) -> Vec<u8> {
+        self.core.borrow().config()
     }
 
-    fn is_leader(&self) -> bool {
-        self.core.borrow().get_leader()
+    fn leader(&self) -> bool {
+        self.core.borrow().leader()
     }
 
     fn propose_event(&mut self, event: Vec<u8>) -> Result<(), crate::model::ActorError> {
@@ -127,13 +127,13 @@ impl ActorContext for DriverContext {
     }
 
     fn send_message(&mut self, message: Vec<u8>) {
-        self.core.borrow_mut().append_message(EnvelopeOut {
-            msg: Some(envelope_out::Msg::ExecuteProposal(
+        self.core
+            .borrow_mut()
+            .append_message(envelope_out::Msg::ExecuteProposal(
                 ExecuteProposalResponse {
                     result_contents: message,
                 },
-            )),
-        });
+            ));
     }
 }
 
@@ -204,50 +204,61 @@ impl Driver {
         }
     }
 
+    fn id(&self) -> u64 {
+        self.raft_node_id
+    }
+
     fn mut_core(&mut self) -> RefMut<'_, DriverContextCore> {
         self.core.borrow_mut()
     }
 
-    fn send_messages(&mut self, host: &mut impl Host, out_messages: Vec<EnvelopeOut>) {
-        let mut serialized_out_messages: Vec<MessageEnvelope> =
-            Vec::with_capacity(out_messages.len());
-        for out_message in &out_messages {
-            serialized_out_messages.push(out_message.encode_to_vec());
-        }
-
-        host.send_messages(&serialized_out_messages).unwrap();
+    fn mut_raft_node(&mut self) -> &mut RaftNode {
+        self.raft_node
+            .as_mut()
+            .expect("Raft node is initialized")
+            .as_mut()
     }
 
-    fn initilize_raft_node(&mut self, is_leader: bool) -> Result<(), PalError> {
-        let config = RaftConfig::new(self.get_id());
+    fn raft_node(&self) -> &RaftNode {
+        self.raft_node
+            .as_ref()
+            .expect("Raft node is initialized")
+            .as_ref()
+    }
+
+    fn initilize_raft_node(&mut self, leader: bool) -> Result<(), PalError> {
+        let config = RaftConfig::new(self.id());
 
         let mut snapshot = RaftSnapshot::default();
         snapshot.mut_metadata().index = 1;
         snapshot.mut_metadata().term = 1;
-        snapshot.mut_metadata().mut_conf_state().voters = vec![self.get_id()];
+        snapshot.mut_metadata().mut_conf_state().voters = vec![self.id()];
 
         let storage = MemStorage::new();
-        if is_leader {
-            storage
-                .wl()
-                .apply_snapshot(snapshot)
-                .map_err(|_e| PalError::Internal)?;
+        if leader {
+            storage.wl().apply_snapshot(snapshot).map_err(|e| {
+                error!(
+                    self.logger,
+                    "Failed to apply Raft snapshot to storage: {}", e
+                );
+
+                // Failure to apply Raft snapshot to storage must lead to termination.
+                PalError::Storage
+            })?;
         }
 
         self.raft_node = Some(Box::new(
-            RawNode::new(&config, storage, &self.logger).map_err(|_e| PalError::Internal)?,
+            RawNode::new(&config, storage, &self.logger).map_err(|e| {
+                error!(self.logger, "Failed to create Raft node: {}", e);
+
+                // Failure to create Raft node must lead to termination.
+                PalError::Raft
+            })?,
         ));
+
         self.tick_instant = self.instant;
 
         Ok(())
-    }
-
-    fn mut_raft_node(&mut self) -> &mut RaftNode {
-        self.raft_node.as_mut().expect("initialized").as_mut()
-    }
-
-    fn raft_node(&self) -> &RaftNode {
-        self.raft_node.as_ref().expect("initialized").as_ref()
     }
 
     fn check_raft_leadership(&self) -> bool {
@@ -259,26 +270,51 @@ impl Driver {
         sender_node_id: u64,
         recipient_node_id: u64,
         message_contents: &Vec<u8>,
-    ) {
-        let message = deserialize_raft_message(message_contents).unwrap();
+    ) -> Result<(), PalError> {
+        match deserialize_raft_message(message_contents) {
+            Err(e) => {
+                warn!(
+                    self.logger,
+                    "Ignoring failed to deserialize Raft message: {}", e
+                );
 
-        debug!(self.logger, "Making raft step");
+                Ok(())
+            }
+            Ok(message) => {
+                debug!(self.logger, "Making Raft step");
 
-        if self.raft_node_id != recipient_node_id {
-            // Ignore incorrectly routed message
-            todo!()
+                if self.raft_node_id != recipient_node_id {
+                    // Ignore incorrectly routed message
+                    warn!(
+                        self.logger,
+                        "Ignoring incorectly routed Raft message: recipient id {}",
+                        recipient_node_id
+                    );
+                }
+                if message.get_from() != sender_node_id {
+                    // Ignore malformed message
+                    warn!(
+                        self.logger,
+                        "Ignoring malformed Raft message: sender id {}", sender_node_id
+                    );
+                }
+
+                // Advance Raft internal state by one step.
+                match self.mut_raft_node().step(message) {
+                    Err(e) => {
+                        error!(self.logger, "Raft experienced unrecoverable error: {}", e);
+
+                        // Unrecoverable Raft errors must lead to termination.
+                        Err(PalError::Raft)
+                    }
+                    Ok(_) => Ok(()),
+                }
+            }
         }
-        if message.get_from() != sender_node_id {
-            // Ignore malformed message
-            todo!()
-        }
-
-        // Advance raft internal state by one step.
-        self.mut_raft_node().step(message).unwrap();
     }
 
     fn make_raft_proposal(&mut self, proposal_contents: Vec<u8>) {
-        debug!(self.logger, "Making raft proposal");
+        debug!(self.logger, "Making Raft proposal");
 
         self.mut_raft_node()
             .propose(vec![], proposal_contents)
@@ -289,26 +325,40 @@ impl Driver {
         &mut self,
         node_id: u64,
         change_type: RaftConfigChangeType,
-    ) {
-        debug!(self.logger, "Making raft config change proposal");
+    ) -> Result<ChangeClusterStatus, PalError> {
+        debug!(self.logger, "Making Raft config change proposal");
 
         let config_change = create_raft_config_change(node_id, change_type);
-        self.mut_raft_node()
+        match self
+            .mut_raft_node()
             .propose_conf_change(vec![], config_change)
-            .unwrap();
+        {
+            Ok(_) => Ok(ChangeClusterStatus::ChangeStatusPending),
+            Err(RaftError::ProposalDropped) => {
+                warn!(self.logger, "Dropping Raft config change proposal");
+
+                Ok(ChangeClusterStatus::ChangeStatusRejected)
+            }
+            Err(e) => {
+                error!(self.logger, "Raft experienced unrecoverable error: {}", e);
+
+                // Unrecoverable Raft errors must lead to termination.
+                Err(PalError::Raft)
+            }
+        }
     }
 
     fn trigger_raft_tick(&mut self) {
-        // Given that raft is being driven from the outside and arbitrary amount of time can
+        // Given that Raft is being driven from the outside and arbitrary amount of time can
         // pass between driver invocation we may need to produce multiple ticks.
         while self.instant - self.tick_instant >= self.driver_config.tick_period {
             self.tick_instant += self.driver_config.tick_period;
             debug!(
                 self.logger,
-                "Triggering raft tick at {i}",
+                "Triggering Raft tick at {i}",
                 i = self.tick_instant
             );
-            // invoke raft tick to trigger timer based changes.
+            // invoke Raft tick to trigger timer based changes.
             self.mut_raft_node().tick();
         }
     }
@@ -325,23 +375,27 @@ impl Driver {
             }
             // The entry may either be a config change or a normal proposal.
             if let RaftEntryType::EntryConfChange = committed_entry.get_entry_type() {
+                debug!(self.logger, "Applying Raft config change entry");
+
                 // Make committed configuration effective.
                 let config_change = deserialize_config_change(&committed_entry.data).unwrap();
-                let config_state = self
-                    .mut_raft_node()
-                    .apply_conf_change(&config_change)
-                    .unwrap();
+                match self.mut_raft_node().apply_conf_change(&config_change) {
+                    Err(e) => {
+                        error!(self.logger, "Failed to apply Raft config change: {}", e);
+                        // Failure to apply Raft config change must lead to termination.
+                        return Err(PalError::Raft);
+                    }
+                    Ok(config_state) => {
+                        self.collect_config_state(&config_state);
 
-                debug!(self.logger, "Applying raft config change entry");
-
-                self.collect_config_state(&config_state);
-
-                self.mut_raft_node()
-                    .store()
-                    .wl()
-                    .set_conf_state(config_state);
+                        self.mut_raft_node()
+                            .store()
+                            .wl()
+                            .set_conf_state(config_state);
+                    }
+                };
             } else {
-                debug!(self.logger, "Applying raft entry");
+                debug!(self.logger, "Applying Raft entry");
 
                 // Pass committed entry to the actor to make effective.
                 self.actor
@@ -351,7 +405,6 @@ impl Driver {
                             self.logger,
                             "Failed to apply committed event to actor state: {}", e
                         );
-
                         // Failure to apply committed event to actor state must lead to termination.
                         PalError::Actor
                     })?;
@@ -364,19 +417,17 @@ impl Driver {
     fn send_raft_messages(&mut self, raft_messages: Vec<RaftMessage>) -> Result<(), PalError> {
         debug!(
             self.logger,
-            "Sending {msg_count} raft messages",
+            "Sending {msg_count} Raft messages",
             msg_count = raft_messages.len()
         );
 
         for raft_message in raft_messages {
             // Buffer message to be sent out.
-            self.send_message(EnvelopeOut {
-                msg: Some(envelope_out::Msg::DeliverMessage(DeliverMessage {
-                    recipient_node_id: raft_message.to,
-                    sender_node_id: self.get_id(),
-                    message_contents: serialize_raft_message(&raft_message).unwrap(),
-                })),
-            });
+            self.stash_message(envelope_out::Msg::DeliverMessage(DeliverMessage {
+                recipient_node_id: raft_message.to,
+                sender_node_id: self.id(),
+                message_contents: serialize_raft_message(&raft_message).unwrap(),
+            }));
         }
 
         Ok(())
@@ -388,7 +439,7 @@ impl Driver {
             return Ok(());
         }
 
-        info!(self.logger, "Restoring raft snappshot");
+        info!(self.logger, "Restoring Raft snappshot");
 
         self.collect_config_state(get_conf_state(raft_snapshot));
 
@@ -424,16 +475,16 @@ impl Driver {
     }
 
     fn advance_raft(&mut self) -> Result<(), PalError> {
-        // Given that instant only set once trigger raft tick once as well.
+        // Given that instant only set once trigger Raft tick once as well.
         self.trigger_raft_tick();
 
         if !self.raft_node().has_ready() {
-            debug!(self.logger, "No raft ready to process");
+            debug!(self.logger, "No Raft ready to process");
             // There is nothing process.
             return Ok(());
         }
 
-        debug!(self.logger, "Processing raft ready");
+        debug!(self.logger, "Processing Raft ready");
 
         let mut raft_ready = self.mut_raft_node().ready();
 
@@ -467,7 +518,7 @@ impl Driver {
                 .map_err(|_e| PalError::Internal)?;
         }
 
-        // Advance raft state after fully processing ready.
+        // Advance Raft state after fully processing ready.
         let mut light_raft_ready: raft::LightReady = self.mut_raft_node().advance(raft_ready);
 
         // Send out messages to the peers.
@@ -488,7 +539,7 @@ impl Driver {
         self.raft_state.committed_cluster_config = config_state.voters.clone();
     }
 
-    fn send_leader_state(&mut self) {
+    fn stash_leader_state(&mut self) {
         let raft_hard_state: HardState;
         let raft_soft_state: SoftState;
         {
@@ -508,14 +559,12 @@ impl Driver {
 
         self.prev_raft_state = self.raft_state.clone();
 
-        self.send_message(EnvelopeOut {
-            msg: Some(envelope_out::Msg::CheckCluster(CheckClusterResponse {
-                leader_node_id: self.raft_state.leader_node_id,
-                leader_term: self.raft_state.leader_term,
-                cluster_node_ids: self.raft_state.committed_cluster_config.clone(),
-                has_pending_changes: self.raft_state.has_pending_change,
-            })),
-        });
+        self.stash_message(envelope_out::Msg::CheckCluster(CheckClusterResponse {
+            leader_node_id: self.raft_state.leader_node_id,
+            leader_term: self.raft_state.leader_term,
+            cluster_node_ids: self.raft_state.committed_cluster_config.clone(),
+            has_pending_changes: self.raft_state.has_pending_change,
+        }));
     }
 
     fn preset_state_machine(&mut self, instant: u64) {
@@ -576,11 +625,9 @@ impl Driver {
 
         self.driver_state = DriverState::Started;
 
-        self.send_message(EnvelopeOut {
-            msg: Some(envelope_out::Msg::StartNode(StartNodeResponse {
-                node_id: self.get_id(),
-            })),
-        });
+        self.stash_message(envelope_out::Msg::StartNode(StartNodeResponse {
+            node_id: self.id(),
+        }));
 
         Ok(())
     }
@@ -603,16 +650,27 @@ impl Driver {
     ) -> Result<(), PalError> {
         self.check_driver_started()?;
 
-        let change_type = match ChangeClusterType::from_i32(change_cluster_request.change_type) {
-            Some(ChangeClusterType::ChangeTypeAddNode) => RaftConfigChangeType::AddNode,
-            Some(ChangeClusterType::ChangeTypeRemoveNode) => RaftConfigChangeType::RemoveNode,
+        let change_status = match ChangeClusterType::from_i32(change_cluster_request.change_type) {
+            Some(ChangeClusterType::ChangeTypeAddNode) => self.make_raft_config_change_proposal(
+                change_cluster_request.node_id,
+                RaftConfigChangeType::AddNode,
+            )?,
+            Some(ChangeClusterType::ChangeTypeRemoveNode) => self
+                .make_raft_config_change_proposal(
+                    change_cluster_request.node_id,
+                    RaftConfigChangeType::RemoveNode,
+                )?,
             _ => {
-                error!(self.logger, "Unknown cluster change command");
-                return Ok(());
+                warn!(self.logger, "Rejecting cluster change command: unknown");
+
+                ChangeClusterStatus::ChangeStatusRejected
             }
         };
 
-        self.make_raft_config_change_proposal(change_cluster_request.node_id, change_type);
+        self.stash_message(envelope_out::Msg::ChangeCluster(ChangeClusterResponse {
+            change_id: change_cluster_request.change_id,
+            change_status: change_status.into(),
+        }));
 
         Ok(())
     }
@@ -638,9 +696,7 @@ impl Driver {
             deliver_message.sender_node_id,
             deliver_message.recipient_node_id,
             &deliver_message.message_contents,
-        );
-
-        Ok(())
+        )
     }
 
     fn process_execute_proposal(
@@ -669,42 +725,46 @@ impl Driver {
         }
 
         for message in messages {
-            self.send_message(message);
+            self.stash_message(message);
         }
     }
 
     fn process_state_machine(&mut self) -> Result<Vec<EnvelopeOut>, PalError> {
         if self.raft_node.is_some() {
-            // Advance raft internal state.
+            // Advance Raft internal state.
             self.advance_raft()?;
 
             // Maybe create a snashot of the actor to reduce the size of the log.
             self.maybe_create_raft_snapshot()?;
 
             // If the leader state has changed send it out for observability.
-            self.send_leader_state();
+            self.stash_leader_state();
         }
 
-        self.send_log_entries();
+        self.stash_log_entries();
 
         // Take messages to be sent out.
         Ok(mem::take(&mut self.messages))
     }
 
-    fn get_id(&self) -> u64 {
-        self.raft_node_id
-    }
-
-    fn send_log_entries(&mut self) {
+    fn stash_log_entries(&mut self) {
         for log_message in self.logger_output.take_entries() {
-            self.send_message(EnvelopeOut {
-                msg: Some(envelope_out::Msg::Log(log_message)),
-            });
+            self.stash_message(envelope_out::Msg::Log(log_message));
         }
     }
 
-    fn send_message(&mut self, message: EnvelopeOut) {
-        self.messages.push(message);
+    fn stash_message(&mut self, message: envelope_out::Msg) {
+        self.messages.push(EnvelopeOut { msg: Some(message) });
+    }
+
+    fn send_messages(&mut self, host: &mut impl Host, out_messages: Vec<EnvelopeOut>) {
+        let mut serialized_out_messages: Vec<MessageEnvelope> =
+            Vec::with_capacity(out_messages.len());
+        for out_message in &out_messages {
+            serialized_out_messages.push(out_message.encode_to_vec());
+        }
+
+        host.send_messages(&serialized_out_messages).unwrap();
     }
 }
 
@@ -722,41 +782,54 @@ impl Application for Driver {
 
         // Dispatch incoming message for processing.
         if let Some(serialized_message) = opt_message {
-            let deserialized_message =
-                EnvelopeIn::decode(serialized_message.as_ref()).map_err(|_e| PalError::Decoding)?;
-            let message = deserialized_message.msg.ok_or(PalError::UnknownMessage)?;
-
-            match message {
-                envelope_in::Msg::StartNode(ref start_node_request) => self.process_start_node(
-                    start_node_request,
-                    host.get_self_config(),
-                    host.get_self_attestation().public_signing_key(),
-                ),
-                envelope_in::Msg::StopNode(ref stop_node_request) => {
-                    self.process_stop_node(stop_node_request)
+            match EnvelopeIn::decode(serialized_message.as_ref()) {
+                Ok(deserialized_message) => match deserialized_message.msg {
+                    None => {
+                        warn!(self.logger, "Rejecting message: unknown");
+                        // Ignore unknown message.
+                        return Ok(());
+                    }
+                    Some(message) => {
+                        match message {
+                            envelope_in::Msg::StartNode(ref start_node_request) => self
+                                .process_start_node(
+                                    start_node_request,
+                                    host.get_self_config(),
+                                    host.get_self_attestation().public_signing_key(),
+                                ),
+                            envelope_in::Msg::StopNode(ref stop_node_request) => {
+                                self.process_stop_node(stop_node_request)
+                            }
+                            envelope_in::Msg::ChangeCluster(ref change_cluster_request) => {
+                                self.process_change_cluster(change_cluster_request)
+                            }
+                            envelope_in::Msg::CheckCluster(ref check_cluster_request) => {
+                                self.process_check_cluster(check_cluster_request)
+                            }
+                            envelope_in::Msg::DeliverMessage(ref deliver_message) => {
+                                self.process_deliver_message(deliver_message)
+                            }
+                            envelope_in::Msg::ExecuteProposal(ref execute_proposal_request) => {
+                                self.process_execute_proposal(execute_proposal_request)
+                            }
+                        }?;
+                    }
+                },
+                Err(e) => {
+                    warn!(self.logger, "Rejecting message: {}", e);
+                    // Ignore message that cannot be decoded.
+                    return Ok(());
                 }
-                envelope_in::Msg::ChangeCluster(ref change_cluster_request) => {
-                    self.process_change_cluster(change_cluster_request)
-                }
-                envelope_in::Msg::CheckCluster(ref check_cluster_request) => {
-                    self.process_check_cluster(check_cluster_request)
-                }
-                envelope_in::Msg::DeliverMessage(ref deliver_message) => {
-                    self.process_deliver_message(deliver_message)
-                }
-                envelope_in::Msg::ExecuteProposal(ref execute_proposal_request) => {
-                    self.process_execute_proposal(execute_proposal_request)
-                }
-            }?;
+            };
         }
 
         // Collect outpus like messages, log entries and proposals from the actor.
         self.process_actor_output();
 
-        // Advance the raft amd collect results messages.
+        // Advance the Raft and collect results messages.
         let out_messages = self.process_state_machine()?;
 
-        // Send messages to raft peers and consumers through the trusted host.
+        // Send messages to Raft peers and consumers through the trusted host.
         self.send_messages(host, out_messages);
 
         Ok(())

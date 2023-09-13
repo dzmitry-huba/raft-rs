@@ -38,26 +38,26 @@ impl fmt::Display for ActorError {
 /// consensus module and the trusted host.
 pub trait ActorContext {
     /// Gets logger to send entries through the trusted host to the untrusted launcher.
-    fn get_logger(&self) -> &Logger;
+    fn logger(&self) -> &Logger;
 
     /// Gets the identity of the underyling consensus module node in the consensus
     /// cluster.
-    fn get_id(&self) -> u64;
+    fn id(&self) -> u64;
 
     /// Gets a measurement of a monotonically nondecreasing clock provided by
     /// the untrusted launcher to the trusted host. The resolution of the instant is
     /// mesured in milliseconds. Instants are opaque that can only be compared to one
     /// another. In other words the absolute value must not be interpretted as wall
     /// clock time or time since the trusted application start.
-    fn get_instant(&self) -> u64;
+    fn instant(&self) -> u64;
 
     /// Gets serialized configuration that stays immutable through the lifetime of
     /// the trusted application.
-    fn get_config(&self) -> Vec<u8>;
+    fn config(&self) -> Vec<u8>;
 
     /// Checks if the underlying consensus module is currently executing under leader
     /// role.
-    fn is_leader(&self) -> bool;
+    fn leader(&self) -> bool;
 
     /// Proposes an even to the underlying consensus module for replication. Returns
     /// error if underlying consensus module is not currently executing under leader
