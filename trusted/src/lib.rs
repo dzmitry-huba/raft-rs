@@ -4,6 +4,7 @@
 extern crate alloc;
 #[cfg(feature = "std")]
 extern crate core;
+extern crate hashbrown;
 extern crate prost;
 extern crate raft;
 extern crate slog;
