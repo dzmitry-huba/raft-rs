@@ -90,17 +90,20 @@ pub mod raft {
         term: u64,
         config_state: RaftConfigState,
     ) -> RaftSnapshotMetadata {
-        let mut metadata = RaftSnapshotMetadata::default();
-        metadata.index = index;
-        metadata.term = term;
+        let mut metadata = RaftSnapshotMetadata {
+            index,
+            term,
+            ..Default::default()
+        };
         *metadata.mut_conf_state() = config_state;
         metadata
     }
 
     pub fn create_raft_config_state(voters: Vec<u64>) -> RaftConfigState {
-        let mut config_state = RaftConfigState::default();
-        config_state.voters = voters;
-        config_state
+        RaftConfigState {
+            voters,
+            ..Default::default()
+        }
     }
 
     pub fn config_state_contains_node(config_state: &RaftConfigState, node_id: u64) -> bool {
@@ -152,10 +155,10 @@ pub mod raft {
     }
 
     pub fn create_raft_snapshot(metadata: RaftSnapshotMetadata, data: Vec<u8>) -> RaftSnapshot {
-        let mut snapshot = RaftSnapshot::default();
-        snapshot.metadata = Some(metadata);
-        snapshot.data = data.into();
-        snapshot
+        RaftSnapshot {
+            metadata: Some(metadata),
+            data: data.into(),
+        }
     }
 
     pub fn create_raft_snapshot_metadata(
@@ -163,17 +166,18 @@ pub mod raft {
         term: u64,
         config_state: RaftConfigState,
     ) -> RaftSnapshotMetadata {
-        let mut metadata = RaftSnapshotMetadata::default();
-        metadata.index = index;
-        metadata.term = term;
-        metadata.conf_state = Some(config_state);
-        metadata
+        RaftSnapshotMetadata {
+            index,
+            term,
+            conf_state: Some(config_state),
+        }
     }
 
     pub fn create_raft_config_state(voters: Vec<u64>) -> RaftConfigState {
-        let mut config_state = RaftConfigState::default();
-        config_state.voters = voters;
-        config_state
+        RaftConfigState {
+            voters: voters,
+            ..Default::default()
+        }
     }
 
     pub fn config_state_contains_node(config_state: &RaftConfigState, node_id: u64) -> bool {

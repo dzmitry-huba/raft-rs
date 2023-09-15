@@ -477,7 +477,7 @@ impl Driver {
         info!(
             self.logger,
             "Restoring Raft snappshot: {:?}",
-            get_metadata(&raft_snapshot)
+            get_metadata(raft_snapshot)
         );
 
         self.collect_config_state(get_config_state(raft_snapshot).clone());
