@@ -18,6 +18,7 @@ pub mod driver;
 pub mod logger;
 pub mod model;
 pub mod platform;
+pub mod storage;
 pub mod util;
 
 #[cfg(not(feature = "std"))]

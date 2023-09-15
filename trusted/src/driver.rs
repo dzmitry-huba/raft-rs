@@ -1,9 +1,14 @@
+#![allow(clippy::useless_conversion)]
 use crate::endpoint::*;
 use crate::logger::{log::create_remote_logger, DrainOutput};
 use crate::model::{Actor, ActorContext};
+use crate::storage::MemoryStorage;
 use crate::util::raft::{
-    create_raft_config_change, deserialize_config_change, deserialize_raft_message, get_conf_state,
-    serialize_raft_message,
+    create_raft_config_change, deserialize_config_change, deserialize_raft_message,
+    get_config_state, get_metadata, serialize_raft_message,
+};
+use crate::util::raft::{
+    create_raft_config_state, create_raft_snapshot, create_raft_snapshot_metadata,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -18,14 +23,14 @@ use platform::{Application, Host, MessageEnvelope, PalError};
 use prost::Message;
 use raft::SoftState;
 use raft::{
-    eraftpb::ConfChangeType as RaftConfigChangeType, eraftpb::ConfState as RaftConfState,
+    eraftpb::ConfChangeType as RaftConfigChangeType, eraftpb::ConfState as RaftConfigState,
     eraftpb::Entry as RaftEntry, eraftpb::EntryType as RaftEntryType, eraftpb::HardState,
     eraftpb::Message as RaftMessage, eraftpb::MessageType as RaftMessageType,
-    eraftpb::Snapshot as RaftSnapshot, storage::MemStorage, Config as RaftConfig,
-    Error as RaftError, RawNode, StateRole as RaftStateRole,
+    eraftpb::Snapshot as RaftSnapshot, Config as RaftConfig, Error as RaftError, RawNode,
+    StateRole as RaftStateRole,
 };
 use slog::{debug, error, info, o, warn, Logger};
-type RaftNode = RawNode<MemStorage>;
+type RaftNode = RawNode<MemoryStorage>;
 
 struct DriverContextCore {
     id: u64,
@@ -170,6 +175,20 @@ impl RaftState {
     }
 }
 
+struct RaftProgress {
+    applied_index: u64,
+    config_state: RaftConfigState,
+}
+
+impl RaftProgress {
+    fn new() -> RaftProgress {
+        RaftProgress {
+            applied_index: 0,
+            config_state: RaftConfigState::default(),
+        }
+    }
+}
+
 pub struct Driver {
     core: Rc<RefCell<DriverContextCore>>,
     actor: Box<dyn Actor>,
@@ -185,6 +204,7 @@ pub struct Driver {
     raft_node: Option<Box<RaftNode>>,
     raft_state: RaftState,
     prev_raft_state: RaftState,
+    raft_progress: RaftProgress,
 }
 
 impl Driver {
@@ -205,6 +225,7 @@ impl Driver {
             raft_node: None,
             raft_state: RaftState::new(),
             prev_raft_state: RaftState::new(),
+            raft_progress: RaftProgress::new(),
         }
     }
 
@@ -233,14 +254,15 @@ impl Driver {
     fn initilize_raft_node(&mut self, leader: bool) -> Result<(), PalError> {
         let config = RaftConfig::new(self.id());
 
-        let mut snapshot = RaftSnapshot::default();
-        snapshot.mut_metadata().index = 1;
-        snapshot.mut_metadata().term = 1;
-        snapshot.mut_metadata().mut_conf_state().voters = vec![self.id()];
-
-        let storage = MemStorage::new();
+        let mut storage =
+            MemoryStorage::new(self.logger.clone(), self.driver_config.snapshot_count);
         if leader {
-            storage.wl().apply_snapshot(snapshot).map_err(|e| {
+            let snapshot = create_raft_snapshot(
+                create_raft_snapshot_metadata(1, 1, create_raft_config_state(vec![self.id()])),
+                Vec::new(),
+            );
+
+            storage.apply_snapshot(snapshot).map_err(|e| {
                 error!(
                     self.logger,
                     "Failed to apply Raft snapshot to storage: {}", e
@@ -353,8 +375,8 @@ impl Driver {
     fn trigger_raft_tick(&mut self) {
         // Given that Raft is being driven from the outside and arbitrary amount of time can
         // pass between driver invocation we may need to produce multiple ticks.
-        while self.instant - self.tick_instant >= self.driver_config.tick_period {
-            self.tick_instant += self.driver_config.tick_period;
+        if self.instant - self.tick_instant >= self.driver_config.tick_period {
+            self.tick_instant = self.instant;
             // invoke Raft tick to trigger timer based changes.
             self.mut_raft_node().tick();
         }
@@ -365,6 +387,9 @@ impl Driver {
         committed_entries: Vec<RaftEntry>,
     ) -> Result<(), PalError> {
         for committed_entry in committed_entries {
+            // Remember progress of applying committed entries.
+            self.raft_progress.applied_index = committed_entry.index;
+
             if committed_entry.data.is_empty() {
                 // Empty entry is produced by the newly elected leader to commit entries
                 // from the previous terms.
@@ -372,8 +397,6 @@ impl Driver {
             }
             // The entry may either be a config change or a normal proposal.
             if let RaftEntryType::EntryConfChange = committed_entry.get_entry_type() {
-                debug!(self.logger, "Applying Raft config change entry");
-
                 // Make committed configuration effective.
                 let config_change = match deserialize_config_change(&committed_entry.data) {
                     Ok(config_change) => config_change,
@@ -387,6 +410,11 @@ impl Driver {
                     }
                 };
 
+                debug!(
+                    self.logger,
+                    "Applying Raft config change entry: {:?}", config_change
+                );
+
                 match self.mut_raft_node().apply_conf_change(&config_change) {
                     Err(e) => {
                         error!(self.logger, "Failed to apply Raft config change: {}", e);
@@ -394,12 +422,7 @@ impl Driver {
                         return Err(PalError::Raft);
                     }
                     Ok(config_state) => {
-                        self.collect_config_state(&config_state);
-
-                        self.mut_raft_node()
-                            .store()
-                            .wl()
-                            .set_conf_state(config_state);
+                        self.collect_config_state(config_state);
                     }
                 };
             } else {
@@ -451,15 +474,18 @@ impl Driver {
             return Ok(());
         }
 
-        info!(self.logger, "Restoring Raft snappshot");
+        info!(
+            self.logger,
+            "Restoring Raft snappshot: {:?}",
+            get_metadata(&raft_snapshot)
+        );
 
-        self.collect_config_state(get_conf_state(raft_snapshot));
+        self.collect_config_state(get_config_state(raft_snapshot).clone());
 
         // Persist unstable snapshot received from a peer into the stable storage.
         let apply_result = self
             .mut_raft_node()
-            .store()
-            .wl()
+            .mut_store()
             .apply_snapshot(raft_snapshot.clone());
         if let Err(e) = apply_result {
             error!(
@@ -479,19 +505,36 @@ impl Driver {
                 PalError::Actor
             })?;
 
+        // Applied index is reset to the snapshot index.
+        self.raft_progress.applied_index = get_metadata(raft_snapshot).index;
+
         Ok(())
     }
 
     fn maybe_create_raft_snapshot(&mut self) -> Result<(), PalError> {
-        let _actor_snapshot = self.actor.on_save_snapshot().map_err(|e| {
+        if !self.raft_node().store().should_snapshot(
+            self.raft_progress.applied_index,
+            &self.raft_progress.config_state,
+        ) {
+            return Ok(());
+        }
+
+        let snapshot_data = self.actor.on_save_snapshot().map_err(|e| {
             error!(self.logger, "Failed to save actor state to snapshot: {}", e);
             // Failure to apply Raft snapshot to storage snapshot must lead to termination.
             PalError::Actor
         })?;
 
-        // todo!()
-
-        Ok(())
+        let applied_index = self.raft_progress.applied_index;
+        let config_state = self.raft_progress.config_state.clone();
+        self.mut_raft_node()
+            .mut_store()
+            .create_snapshot(applied_index, config_state, snapshot_data)
+            .map_err(|e| {
+                error!(self.logger, "Failed to save actor state to snapshot: {}", e);
+                // Failure to create Raft snapshot to storage snapshot must lead to termination.
+                PalError::Actor
+            })
     }
 
     fn advance_raft(&mut self) -> Result<(), PalError> {
@@ -511,9 +554,8 @@ impl Driver {
         if let Some(raft_hard_state) = raft_ready.hs() {
             // Persist changed hard state into the stable storage.
             self.mut_raft_node()
-                .store()
-                .wl()
-                .set_hardstate(raft_hard_state.clone());
+                .mut_store()
+                .set_hard_state(raft_hard_state.clone());
         }
 
         // If not empty persist snapshot to stable storage and apply it to the
@@ -530,9 +572,8 @@ impl Driver {
             // Persist unstable entries into the stable storage.
             let append_result = self
                 .mut_raft_node()
-                .store()
-                .wl()
-                .append(raft_ready.entries());
+                .mut_store()
+                .append_entries(raft_ready.entries());
             if let Err(e) = append_result {
                 error!(
                     self.logger,
@@ -560,8 +601,9 @@ impl Driver {
         self.raft_state = RaftState::new();
     }
 
-    fn collect_config_state(&mut self, config_state: &RaftConfState) {
+    fn collect_config_state(&mut self, config_state: RaftConfigState) {
         self.raft_state.committed_cluster_config = config_state.voters.clone();
+        self.raft_progress.config_state = config_state;
     }
 
     fn stash_leader_state(&mut self) {

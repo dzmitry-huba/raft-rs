@@ -4,7 +4,8 @@ use core::fmt;
 use core::result::Result;
 use raft::eraftpb::{
     ConfChange as RaftConfigChange, ConfChangeType as RaftConfigChangeType,
-    ConfState as RaftConfState, Message as RaftMessage, Snapshot as RaftSnapshot,
+    ConfState as RaftConfigState, Message as RaftMessage, Snapshot as RaftSnapshot,
+    SnapshotMetadata as RaftSnapshotMetadata,
 };
 
 #[derive(Debug)]
@@ -69,8 +70,46 @@ pub mod raft {
         }
     }
 
-    pub fn get_conf_state(snapshot: &RaftSnapshot) -> &RaftConfState {
+    pub fn get_metadata(snapshot: &RaftSnapshot) -> &RaftSnapshotMetadata {
+        snapshot.get_metadata()
+    }
+
+    pub fn get_config_state(snapshot: &RaftSnapshot) -> &RaftConfigState {
         snapshot.get_metadata().get_conf_state()
+    }
+
+    pub fn create_raft_snapshot(metadata: RaftSnapshotMetadata, data: Vec<u8>) -> RaftSnapshot {
+        let mut snapshot = RaftSnapshot::default();
+        *snapshot.mut_metadata() = metadata;
+        *snapshot.mut_data() = data.into();
+        snapshot
+    }
+
+    pub fn create_raft_snapshot_metadata(
+        index: u64,
+        term: u64,
+        config_state: RaftConfigState,
+    ) -> RaftSnapshotMetadata {
+        let mut metadata = RaftSnapshotMetadata::default();
+        metadata.index = index;
+        metadata.term = term;
+        *metadata.mut_conf_state() = config_state;
+        metadata
+    }
+
+    pub fn create_raft_config_state(voters: Vec<u64>) -> RaftConfigState {
+        let mut config_state = RaftConfigState::default();
+        config_state.voters = voters;
+        config_state
+    }
+
+    pub fn config_state_contains_node(config_state: &RaftConfigState, node_id: u64) -> bool {
+        config_state
+            .get_voters()
+            .iter()
+            .chain(config_state.get_learners())
+            .chain(config_state.get_voters_outgoing())
+            .any(|id| *id == node_id)
     }
 }
 
@@ -104,13 +143,45 @@ pub mod raft {
         }
     }
 
-    pub fn get_conf_state(snapshot: &RaftSnapshot) -> &RaftConfState {
+    pub fn get_metadata(snapshot: &RaftSnapshot) -> &RaftSnapshotMetadata {
+        snapshot.metadata.as_ref().unwrap()
+    }
+
+    pub fn get_config_state(snapshot: &RaftSnapshot) -> &RaftConfigState {
+        get_metadata(&snapshot).conf_state.as_ref().unwrap()
+    }
+
+    pub fn create_raft_snapshot(metadata: RaftSnapshotMetadata, data: Vec<u8>) -> RaftSnapshot {
+        let mut snapshot = RaftSnapshot::default();
+        snapshot.metadata = Some(metadata);
+        snapshot.data = data.into();
         snapshot
-            .metadata
-            .as_ref()
-            .unwrap()
-            .conf_state
-            .as_ref()
-            .unwrap()
+    }
+
+    pub fn create_raft_snapshot_metadata(
+        index: u64,
+        term: u64,
+        config_state: RaftConfigState,
+    ) -> RaftSnapshotMetadata {
+        let mut metadata = RaftSnapshotMetadata::default();
+        metadata.index = index;
+        metadata.term = term;
+        metadata.conf_state = Some(config_state);
+        metadata
+    }
+
+    pub fn create_raft_config_state(voters: Vec<u64>) -> RaftConfigState {
+        let mut config_state = RaftConfigState::default();
+        config_state.voters = voters;
+        config_state
+    }
+
+    pub fn config_state_contains_node(config_state: &RaftConfigState, node_id: u64) -> bool {
+        config_state
+            .voters
+            .iter()
+            .chain(&config_state.learners)
+            .chain(&config_state.voters_outgoing)
+            .any(|id| *id == node_id)
     }
 }
