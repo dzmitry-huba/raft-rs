@@ -317,13 +317,10 @@ impl FakeCluster {
         }
 
         for message_in in messages_in {
-            match self.platforms.get_mut(&message_in.recipient_node_id) {
-                Some(platform) => {
-                    platform.append_meessage_in(EnvelopeIn {
-                        msg: Some(envelope_in::Msg::DeliverMessage(message_in)),
-                    });
-                }
-                None => {}
+            if let Some(platform) = self.platforms.get_mut(&message_in.recipient_node_id) {
+                platform.append_meessage_in(EnvelopeIn {
+                    msg: Some(envelope_in::Msg::DeliverMessage(message_in)),
+                });
             }
         }
 
