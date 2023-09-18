@@ -200,58 +200,60 @@ impl Actor for CounterActor {
 
 struct FakeCluster {
     advance_step: u64,
-    platforms: Vec<FakePlatform>,
+    platforms: HashMap<u64, FakePlatform>,
     leader_id: u64,
     pull_messages: Vec<EnvelopeOut>,
 }
 
 impl FakeCluster {
-    fn new(size: usize) -> FakeCluster {
-        let mut cluster = FakeCluster {
+    fn new() -> FakeCluster {
+        FakeCluster {
             advance_step: 100,
-            platforms: Vec::with_capacity(size),
-            leader_id: 1,
+            platforms: HashMap::new(),
+            leader_id: 0,
             pull_messages: Vec::new(),
-        };
-        for i in 0..size {
-            cluster
-                .platforms
-                .push(FakePlatform::new(Self::index_to_id(i)));
         }
-
-        cluster
     }
 
-    fn id_to_index(node_id: u64) -> usize {
-        (node_id - 1) as usize
+    fn leader_id(&self) -> u64 {
+        self.leader_id
     }
 
-    fn index_to_id(node_index: usize) -> u64 {
-        (node_index + 1) as u64
+    fn non_leader_id(&self) -> u64 {
+        *self
+            .platforms
+            .keys()
+            .find(|id| **id != self.leader_id)
+            .unwrap()
     }
 
-    fn start(&mut self) {
-        let leader_id = self.leader_id;
+    fn start_node(&mut self, node_id: u64, leader: bool) {
+        self.platforms.insert(node_id, FakePlatform::new(node_id));
 
-        for i in 0..self.platforms.len() {
-            let node_id = Self::index_to_id(i);
-            self.platforms[i].send_start_node(node_id == leader_id);
+        self.platforms
+            .get_mut(&node_id)
+            .unwrap()
+            .send_start_node(leader);
+    }
+
+    fn stop_node(&mut self, node_id: u64) {
+        self.platforms.remove(&node_id);
+
+        if self.leader_id == node_id {
+            self.leader_id = 0;
         }
-
-        self.advance_until(&mut |envelope_out| match &envelope_out.msg {
-            Some(envelope_out::Msg::CheckCluster(response)) => response.leader_node_id == leader_id,
-            _ => false,
-        });
     }
 
     fn add_node_to_cluster(&mut self, node_id: u64) {
-        let platform_index = Self::id_to_index(self.leader_id);
-        self.platforms[platform_index].send_change_cluster(
-            0,
-            node_id,
-            ChangeClusterType::ChangeTypeAddNode,
-        );
+        self.platforms
+            .get_mut(&self.leader_id)
+            .unwrap()
+            .send_change_cluster(0, node_id, ChangeClusterType::ChangeTypeAddNode);
 
+        self.advance_until_added_to_cluster(node_id);
+    }
+
+    fn advance_until_added_to_cluster(&mut self, node_id: u64) {
         self.advance_until(&mut |envelope_out| match &envelope_out.msg {
             Some(envelope_out::Msg::CheckCluster(response)) => {
                 !response.has_pending_changes && response.cluster_node_ids.contains(&node_id)
@@ -260,14 +262,30 @@ impl FakeCluster {
         });
     }
 
-    fn add_nodes_to_cluster(&mut self) {
-        for i in 0..self.platforms.len() {
-            let node_id = Self::index_to_id(i);
-            if node_id == self.leader_id {
-                continue;
+    fn advance_until_elected_leader(&mut self, excluding_node_id: Option<u64>) {
+        let mut leader_id = 0;
+
+        self.advance_until(&mut |envelope_out| match &envelope_out.msg {
+            Some(envelope_out::Msg::CheckCluster(response)) => {
+                if response.leader_node_id == 0 {
+                    return false;
+                }
+                match excluding_node_id {
+                    Some(exclucding_leader_id)
+                        if exclucding_leader_id == response.leader_node_id =>
+                    {
+                        false
+                    }
+                    _ => {
+                        leader_id = response.leader_node_id;
+                        true
+                    }
+                }
             }
-            self.add_node_to_cluster(node_id);
-        }
+            _ => false,
+        });
+
+        self.leader_id = leader_id;
     }
 
     fn advance_until(
@@ -287,7 +305,7 @@ impl FakeCluster {
 
     fn advance(&mut self) {
         let mut messages_in: Vec<DeliverMessage> = Vec::new();
-        for platform in &mut self.platforms {
+        for (_, platform) in &mut self.platforms {
             let messages_out = platform.take_messages_out();
             for message_out in messages_out {
                 if let Some(envelope_out::Msg::DeliverMessage(deliver_message)) = message_out.msg {
@@ -299,13 +317,17 @@ impl FakeCluster {
         }
 
         for message_in in messages_in {
-            let platform_index = Self::id_to_index(message_in.recipient_node_id);
-            self.platforms[platform_index].append_meessage_in(EnvelopeIn {
-                msg: Some(envelope_in::Msg::DeliverMessage(message_in)),
-            });
+            match self.platforms.get_mut(&message_in.recipient_node_id) {
+                Some(platform) => {
+                    platform.append_meessage_in(EnvelopeIn {
+                        msg: Some(envelope_in::Msg::DeliverMessage(message_in)),
+                    });
+                }
+                None => {}
+            }
         }
 
-        for platform in &mut self.platforms {
+        for (_, platform) in &mut self.platforms {
             platform.advance_time(self.advance_step);
             platform.send_messages_in();
         }
@@ -343,37 +365,43 @@ impl FakeCluster {
 
     fn stop(&mut self) {}
 
-    fn send_compare_and_swap_counter_request(
+    fn send_cas_counter_request(
         &mut self,
+        node_id: u64,
         request_id: u64,
-        counter_name: String,
+        counter_name: &str,
         expected_value: i64,
         new_value: i64,
-    ) -> bool {
-        let counter_response = self.send_counter_request(CounterRequest {
-            id: request_id,
-            name: counter_name,
-            op: Some(counter_request::Op::CompareAndSwap(
-                CounterCompareAndSwapRequest {
-                    expected_value,
-                    new_value,
-                },
-            )),
-        });
-
-        counter_response.status == CounterStatus::Success.into()
+    ) {
+        self.send_counter_request(
+            node_id,
+            CounterRequest {
+                id: request_id,
+                name: counter_name.to_string(),
+                op: Some(counter_request::Op::CompareAndSwap(
+                    CounterCompareAndSwapRequest {
+                        expected_value,
+                        new_value,
+                    },
+                )),
+            },
+        )
     }
 
-    fn send_counter_request(&mut self, counter_request: CounterRequest) -> CounterResponse {
-        let platform_index = Self::id_to_index(self.leader_id);
-        self.platforms[platform_index].send_counter_request(&counter_request);
+    fn send_counter_request(&mut self, node_id: u64, counter_request: CounterRequest) {
+        self.platforms
+            .get_mut(&node_id)
+            .unwrap()
+            .send_counter_request(&counter_request);
+    }
 
+    fn advance_until_counter_response(&mut self, response_id: u64) -> CounterResponse {
         let mut counter_response_opt: Option<CounterResponse> = None;
         let response_messages = self.advance_until(&mut |envelope_out| match &envelope_out.msg {
             Some(envelope_out::Msg::ExecuteProposal(response)) => {
                 let counter_response =
                     CounterResponse::decode(response.result_contents.as_ref()).unwrap();
-                if counter_response.id == counter_request.id {
+                if counter_response.id == response_id {
                     counter_response_opt = Some(counter_response);
                     return true;
                 }
@@ -385,6 +413,34 @@ impl FakeCluster {
         assert!(!response_messages.is_empty());
 
         counter_response_opt.unwrap()
+    }
+
+    fn advance_until_cas_counter_response(
+        &mut self,
+        counter_request_id: u64,
+        counter_response_status: CounterStatus,
+        old_value: i64,
+        new_value: i64,
+    ) -> bool {
+        let counter_response = self.advance_until_counter_response(counter_request_id);
+
+        let counter_op = if counter_response_status == CounterStatus::Success {
+            Some(counter_response::Op::CompareAndSwap(
+                CounterCompareAndSwapResponse {
+                    old_value,
+                    new_value,
+                },
+            ))
+        } else {
+            None
+        };
+
+        counter_response
+            == CounterResponse {
+                id: counter_request_id,
+                status: counter_response_status.into(),
+                op: counter_op,
+            }
     }
 }
 
@@ -564,19 +620,33 @@ mod test {
 
     #[test]
     fn integration() {
-        let cluster_size = 3;
+        let mut cluster = FakeCluster::new();
 
-        let mut cluster = FakeCluster::new(cluster_size);
+        cluster.start_node(1, true);
+        cluster.advance_until_elected_leader(None);
+        assert!(cluster.leader_id() == 1);
 
-        cluster.start();
+        cluster.start_node(2, false);
+        cluster.start_node(3, false);
 
-        cluster.add_nodes_to_cluster();
+        cluster.add_node_to_cluster(2);
 
-        assert!(cluster.send_compare_and_swap_counter_request(1, "counter 1".to_string(), 0, 1));
-        assert!(cluster.send_compare_and_swap_counter_request(2, "counter 2".to_string(), 0, 1));
-        assert!(!cluster.send_compare_and_swap_counter_request(3, "counter 1".to_string(), 0, 1));
-        assert!(cluster.send_compare_and_swap_counter_request(4, "counter 1".to_string(), 1, 2));
+        cluster.send_cas_counter_request(cluster.leader_id(), 1, "counter 1", 0, 1);
+        cluster.send_cas_counter_request(cluster.leader_id(), 2, "counter 2", 0, 1);
 
-        cluster.stop();
+        assert!(cluster.advance_until_cas_counter_response(1, CounterStatus::Success, 0, 1));
+        assert!(cluster.advance_until_cas_counter_response(2, CounterStatus::Success, 0, 1));
+
+        cluster.add_node_to_cluster(3);
+
+        cluster.send_cas_counter_request(cluster.non_leader_id(), 3, "counter 1", 1, 2);
+        assert!(cluster.advance_until_cas_counter_response(3, CounterStatus::NotLeaderError, 0, 0));
+
+        let leader_id = cluster.leader_id();
+        cluster.stop_node(leader_id);
+        cluster.advance_until_elected_leader(Some(leader_id));
+
+        cluster.send_cas_counter_request(cluster.leader_id(), 4, "counter 2", 1, 2);
+        assert!(cluster.advance_until_cas_counter_response(4, CounterStatus::Success, 1, 2));
     }
 }
