@@ -341,6 +341,17 @@ impl MemoryStorage {
         self.core.borrow_mut().append_entries(entries)
     }
 
+    /// Discards all log entries prior to compact_index.
+    /// It is the application's responsibility to not attempt to compact an index
+    /// greater than RaftLog.applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `compact_index` is higher than `Storage::last_index(&self) + 1`.
+    pub fn compact_entries(&mut self, compact_index: u64) -> Result<(), RaftError> {
+        self.core.borrow_mut().compact_entries(compact_index)
+    }
+
     /// Overwrites the contents of this Storage object with those of the given snapshot.
     pub fn apply_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), RaftError> {
         self.core.borrow_mut().apply_snapshot(snapshot)
@@ -401,5 +412,410 @@ impl Storage for MemoryStorage {
 
     fn snapshot(&self, request_index: u64, peer_id: u64) -> Result<RaftSnapshot, RaftError> {
         self.core.borrow_mut().snapshot(request_index, peer_id)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        logger::log::create_logger,
+        util::raft::{
+            create_raft_config_state, create_raft_entry, create_raft_snapshot,
+            create_raft_snapshot_metadata, message_size,
+        },
+    };
+
+    use super::*;
+    use raft::{eraftpb::Entry as RaftEntry, GetEntriesContext};
+
+    fn create_snapshot(snapshot_index: u64, snapshot_term: u64, voters: &Vec<u64>) -> RaftSnapshot {
+        create_raft_snapshot(
+            create_raft_snapshot_metadata(
+                snapshot_index,
+                snapshot_term,
+                create_raft_config_state(voters.clone()),
+            ),
+            Vec::new(),
+        )
+    }
+
+    fn create_storage(
+        snapshot_index: u64,
+        snapshot_term: u64,
+        max_snapshot_diff: u64,
+        entries: &Vec<RaftEntry>,
+        voters: &Vec<u64>,
+    ) -> MemoryStorage {
+        let mut storage = MemoryStorage::new(create_logger(1), max_snapshot_diff);
+
+        let snapshot = create_snapshot(snapshot_index, snapshot_term, voters);
+
+        storage.apply_snapshot(snapshot).unwrap();
+        storage.append_entries(entries.as_ref()).unwrap();
+
+        storage
+    }
+
+    #[test]
+    fn test_storage_term() {
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+        ];
+
+        let voters = vec![1];
+
+        let storage = create_storage(2, 2, 1, &entries, &voters);
+
+        let tests = vec![
+            (1, Err(RaftError::Store(RaftStorageError::Compacted))),
+            (3, Ok(3)),
+            (4, Ok(4)),
+            (5, Ok(5)),
+            (6, Err(RaftError::Store(RaftStorageError::Unavailable))),
+        ];
+
+        for (index, term) in tests {
+            assert_eq!(term, storage.term(index));
+        }
+    }
+
+    #[test]
+    fn test_storage_entries() {
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+            create_raft_entry(6, 6),
+        ];
+
+        let voters = vec![1];
+
+        let storage = create_storage(2, 2, 1, &entries, &voters);
+
+        let tests = vec![
+            (
+                2,
+                6,
+                u64::max_value(),
+                Err(RaftError::Store(RaftStorageError::Compacted)),
+            ),
+            (3, 4, u64::max_value(), Ok(vec![create_raft_entry(3, 3)])),
+            (4, 5, u64::max_value(), Ok(vec![create_raft_entry(4, 4)])),
+            (
+                4,
+                6,
+                u64::max_value(),
+                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+            ),
+            (
+                4,
+                7,
+                u64::max_value(),
+                Ok(vec![
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                    create_raft_entry(6, 6),
+                ]),
+            ),
+            // even if maxsize is zero, the first entry should be returned
+            (4, 7, 0, Ok(vec![create_raft_entry(4, 4)])),
+            // limit to 2
+            (
+                4,
+                7,
+                u64::from(message_size(&entries[1]) + message_size(&entries[2])),
+                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+            ),
+            (
+                4,
+                7,
+                u64::from(
+                    message_size(&entries[1])
+                        + message_size(&entries[2])
+                        + message_size(&entries[3]) / 2,
+                ),
+                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+            ),
+            (
+                4,
+                7,
+                u64::from(
+                    message_size(&entries[1])
+                        + message_size(&entries[2])
+                        + message_size(&entries[3])
+                        - 1,
+                ),
+                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+            ),
+            // all
+            (
+                4,
+                7,
+                u64::from(
+                    message_size(&entries[1])
+                        + message_size(&entries[2])
+                        + message_size(&entries[3]),
+                ),
+                Ok(vec![
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                    create_raft_entry(6, 6),
+                ]),
+            ),
+        ];
+
+        for (low, high, max_size, entries) in tests {
+            assert_eq!(
+                entries,
+                storage.entries(low, high, max_size, GetEntriesContext::empty(false))
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_last_index() {
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+        ];
+
+        let voters = vec![1];
+
+        let mut storage = create_storage(2, 2, 1, &entries, &voters);
+
+        assert_eq!(Ok(5), storage.last_index());
+
+        storage.append_entries(&[create_raft_entry(6, 5)]).unwrap();
+
+        assert_eq!(Ok(6), storage.last_index());
+    }
+
+    #[test]
+    fn test_storage_first_index() {
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+        ];
+
+        let voters = vec![1];
+
+        let mut storage = create_storage(2, 2, 1, &entries, &voters);
+
+        assert_eq!(Ok(3), storage.first_index());
+
+        storage.compact_entries(4).unwrap();
+
+        assert_eq!(Ok(4), storage.first_index());
+    }
+
+    #[test]
+    fn test_storage_compact_entries() {
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+        ];
+
+        let voters = vec![1];
+
+        let tests = vec![(2, 3, 3, 3), (3, 3, 3, 3), (4, 4, 4, 2), (5, 5, 5, 1)];
+
+        for (compact_index, first_index, first_term, remaining_entries) in tests {
+            let mut storage = create_storage(2, 2, 1, &entries, &voters);
+
+            storage.compact_entries(compact_index).unwrap();
+
+            assert_eq!(Ok(first_index), storage.first_index());
+
+            assert_eq!(Ok(first_term), storage.term(first_index));
+
+            assert_eq!(
+                remaining_entries,
+                storage
+                    .entries(
+                        first_index,
+                        storage.last_index().unwrap() + 1,
+                        100,
+                        GetEntriesContext::empty(false)
+                    )
+                    .unwrap()
+                    .len()
+            )
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_storage_append_entries() {
+        use std::panic::{self, AssertUnwindSafe};
+
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+        ];
+
+        let voters = vec![1];
+
+        let tests = vec![
+            (
+                vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                ],
+                Some(vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                ]),
+            ),
+            (
+                vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 6),
+                    create_raft_entry(5, 6),
+                ],
+                Some(vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 6),
+                    create_raft_entry(5, 6),
+                ]),
+            ),
+            (
+                vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                    create_raft_entry(6, 5),
+                ],
+                Some(vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                    create_raft_entry(6, 5),
+                ]),
+            ),
+            // overwrite compacted raft logs is not allowed
+            (
+                vec![
+                    create_raft_entry(2, 3),
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 5),
+                ],
+                None,
+            ),
+            // truncate the existing entries and append
+            (
+                vec![create_raft_entry(4, 5)],
+                Some(vec![create_raft_entry(3, 3), create_raft_entry(4, 5)]),
+            ),
+            // direct append
+            (
+                vec![create_raft_entry(6, 6)],
+                Some(vec![
+                    create_raft_entry(3, 3),
+                    create_raft_entry(4, 4),
+                    create_raft_entry(5, 5),
+                    create_raft_entry(6, 6),
+                ]),
+            ),
+        ];
+
+        for (append_entries, result_entries) in tests {
+            let mut storage = create_storage(2, 2, 1, &entries, &voters);
+
+            let result =
+                panic::catch_unwind(AssertUnwindSafe(|| storage.append_entries(&append_entries)));
+
+            if let Some(result_entries) = result_entries {
+                assert_eq!(
+                    result_entries,
+                    storage
+                        .entries(
+                            storage.first_index().unwrap(),
+                            storage.last_index().unwrap() + 1,
+                            100,
+                            GetEntriesContext::empty(false)
+                        )
+                        .unwrap()
+                );
+            } else {
+                result.unwrap_err();
+            }
+        }
+    }
+
+    #[test]
+    fn test_storage_get_snapshot() {
+        let entries = vec![
+            create_raft_entry(3, 3),
+            create_raft_entry(4, 4),
+            create_raft_entry(5, 5),
+        ];
+
+        let mut voters = vec![1];
+
+        let mut storage = create_storage(2, 2, 1, &entries, &voters);
+
+        let tests = vec![
+            (2, 1, Ok(create_snapshot(2, 2, &voters))),
+            (
+                3,
+                1,
+                Err(RaftError::Store(
+                    RaftStorageError::SnapshotTemporarilyUnavailable,
+                )),
+            ),
+            (
+                2,
+                2,
+                Err(RaftError::Store(
+                    RaftStorageError::SnapshotTemporarilyUnavailable,
+                )),
+            ),
+        ];
+
+        for (snapshot_index, peer_id, snapshot_result) in tests {
+            assert_eq!(snapshot_result, storage.snapshot(snapshot_index, peer_id));
+        }
+
+        voters = vec![1, 2];
+        let config_state = create_raft_config_state(voters.clone());
+
+        assert!(storage.should_snapshot(3, &config_state));
+
+        storage
+            .create_snapshot(3, config_state, Vec::new())
+            .unwrap();
+
+        assert_eq!(Ok(create_snapshot(3, 3, &voters)), storage.snapshot(3, 1));
+        assert_eq!(Ok(create_snapshot(3, 3, &voters)), storage.snapshot(2, 2));
+    }
+
+    #[test]
+    fn test_storage_apply_snapshot() {
+        let entries = vec![];
+
+        let voters = vec![1, 2, 3];
+
+        let mut storage = create_storage(1, 1, 1, &entries, &voters);
+
+        let snapshot = create_snapshot(4, 4, &voters);
+
+        assert_eq!(Ok(()), storage.apply_snapshot(snapshot.clone()));
+
+        assert_eq!(Ok(snapshot), storage.snapshot(4, 1));
+
+        let snapshot = create_snapshot(3, 3, &voters);
+
+        assert_eq!(
+            Err(RaftError::Store(RaftStorageError::SnapshotOutOfDate)),
+            storage.apply_snapshot(snapshot)
+        );
     }
 }

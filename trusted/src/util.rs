@@ -4,8 +4,8 @@ use core::fmt;
 use core::result::Result;
 use raft::eraftpb::{
     ConfChange as RaftConfigChange, ConfChangeType as RaftConfigChangeType,
-    ConfState as RaftConfigState, Message as RaftMessage, Snapshot as RaftSnapshot,
-    SnapshotMetadata as RaftSnapshotMetadata,
+    ConfState as RaftConfigState, Entry as RaftEntry, Message as RaftMessage,
+    Snapshot as RaftSnapshot, SnapshotMetadata as RaftSnapshotMetadata,
 };
 
 #[derive(Debug)]
@@ -36,6 +36,10 @@ pub mod raft {
     use super::*;
     use prost::bytes::Bytes;
     use util::raft::protobuf::Message;
+
+    pub fn message_size<M: Message>(message: &M) -> u32 {
+        message.compute_size()
+    }
 
     pub fn deserialize_raft_message(message_contents: &Vec<u8>) -> Result<RaftMessage, UtilError> {
         let mut message = RaftMessage::new();
@@ -106,6 +110,14 @@ pub mod raft {
         }
     }
 
+    pub fn create_raft_entry(index: u64, term: u64) -> RaftEntry {
+        RaftEntry {
+            index,
+            term,
+            ..Default::default()
+        }
+    }
+
     pub fn config_state_contains_node(config_state: &RaftConfigState, node_id: u64) -> bool {
         config_state
             .get_voters()
@@ -120,6 +132,10 @@ pub mod raft {
 pub mod raft {
     use super::*;
     use prost::Message;
+
+    pub fn message_size<M: Message>(message: &M) -> u32 {
+        message.encoded_len() as u32
+    }
 
     pub fn deserialize_raft_message(message_contents: &Vec<u8>) -> Result<RaftMessage, UtilError> {
         RaftMessage::decode(message_contents.as_ref()).map_err(|_e| UtilError::Decoding)
@@ -176,6 +192,14 @@ pub mod raft {
     pub fn create_raft_config_state(voters: Vec<u64>) -> RaftConfigState {
         RaftConfigState {
             voters: voters,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_raft_entry(index: u64, term: u64) -> RaftEntry {
+        RaftEntry {
+            index,
+            term,
             ..Default::default()
         }
     }
