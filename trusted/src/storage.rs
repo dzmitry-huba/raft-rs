@@ -444,7 +444,7 @@ mod test {
         snapshot_term: u64,
         max_snapshot_diff: u64,
         entries: &Vec<RaftEntry>,
-        voters: &Vec<u64>,
+        voters: &[u64],
     ) -> MemoryStorage {
         let mut storage = MemoryStorage::new(create_logger(1), max_snapshot_diff);
 
