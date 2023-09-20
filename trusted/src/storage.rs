@@ -433,7 +433,7 @@ mod test {
             create_raft_snapshot_metadata(
                 snapshot_index,
                 snapshot_term,
-                create_raft_config_state(voters.to_owned()),
+                create_raft_config_state(Vec::from(voters)),
             ),
             Vec::new(),
         )
