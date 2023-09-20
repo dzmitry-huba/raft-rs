@@ -428,12 +428,12 @@ mod test {
     use super::*;
     use raft::{eraftpb::Entry as RaftEntry, GetEntriesContext};
 
-    fn create_snapshot(snapshot_index: u64, snapshot_term: u64, voters: &Vec<u64>) -> RaftSnapshot {
+    fn create_snapshot(snapshot_index: u64, snapshot_term: u64, voters: &[u64]) -> RaftSnapshot {
         create_raft_snapshot(
             create_raft_snapshot_metadata(
                 snapshot_index,
                 snapshot_term,
-                create_raft_config_state(voters.clone()),
+                create_raft_config_state(voters.to_owned()),
             ),
             Vec::new(),
         )
