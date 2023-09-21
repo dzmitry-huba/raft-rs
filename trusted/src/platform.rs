@@ -27,7 +27,7 @@ use core::result::Result;
 
 pub type MessageEnvelope = Vec<u8>;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum PalError {
     Decoding,
     Encoding,

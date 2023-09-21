@@ -16,6 +16,8 @@ pub mod endpoint {
 
 pub mod driver;
 pub mod logger;
+#[cfg(all(test, feature = "std"))]
+pub mod mock;
 pub mod model;
 pub mod platform;
 pub mod storage;

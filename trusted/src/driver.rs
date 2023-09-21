@@ -151,6 +151,7 @@ enum DriverState {
     Stopped,
 }
 
+#[derive(Clone, Default)]
 pub struct DriverConfig {
     pub tick_period: u64,
     pub snapshot_count: u64,
@@ -904,8 +905,151 @@ impl Application for Driver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod test {
+    extern crate mockall;
+
+    use super::*;
+    use mock::{MockActor, MockAttestation, MockHost};
+    use model::ActorError;
+
+    fn create_actor_config() -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn create_start_node_request(leader: bool, node_id_hint: u64) -> MessageEnvelope {
+        let envelope = EnvelopeIn {
+            msg: Some(envelope_in::Msg::StartNode(StartNodeRequest {
+                is_leader: leader,
+                node_id_hint,
+            })),
+        };
+        envelope.encode_to_vec()
+    }
+
+    fn create_start_node_response(node_id: u64) -> envelope_out::Msg {
+        envelope_out::Msg::StartNode(StartNodeResponse { node_id })
+    }
+
+    fn create_send_messages_matcher(
+        expected: Vec<envelope_out::Msg>,
+    ) -> impl Fn(&[MessageEnvelope]) -> bool {
+        move |envelopes: &[MessageEnvelope]| {
+            let actual: Vec<envelope_out::Msg> = envelopes
+                .iter()
+                .map(|m| EnvelopeOut::decode(m.as_ref()).unwrap().msg.unwrap())
+                .collect();
+            expected.iter().all(|e| actual.contains(e))
+        }
+    }
+
+    struct MockHostBuilder {
+        mock_attestation: MockAttestation,
+        mock_host: MockHost,
+    }
+
+    impl MockHostBuilder {
+        fn new() -> MockHostBuilder {
+            MockHostBuilder {
+                mock_attestation: MockAttestation::new(),
+                mock_host: MockHost::new(),
+            }
+        }
+
+        fn expect_public_signing_key(
+            &mut self,
+            public_signing_key: Vec<u8>,
+        ) -> &mut MockHostBuilder {
+            self.mock_attestation
+                .expect_public_signing_key()
+                .return_once(move || public_signing_key);
+            self
+        }
+
+        fn expect_send_messages(
+            &mut self,
+            sent_messages: Vec<envelope_out::Msg>,
+        ) -> &mut MockHostBuilder {
+            self.mock_host
+                .expect_send_messages()
+                .withf(create_send_messages_matcher(sent_messages))
+                .return_const(());
+
+            self
+        }
+
+        fn take(&mut self) -> MockHost {
+            let mock_attestation = mem::take(&mut self.mock_attestation);
+            let mut mock_host = mem::take(&mut self.mock_host);
+
+            mock_host
+                .expect_get_self_attestation()
+                .return_once(move || Box::new(mock_attestation));
+
+            mock_host
+                .expect_get_self_config()
+                .return_const(create_actor_config());
+
+            mock_host
+        }
+    }
+
+    struct DriverBuilder {
+        mock_actor: MockActor,
+        driver_config: DriverConfig,
+    }
+
+    impl DriverBuilder {
+        fn new(driver_config: DriverConfig) -> DriverBuilder {
+            DriverBuilder {
+                mock_actor: MockActor::new(),
+                driver_config,
+            }
+        }
+
+        fn expect_on_init(&mut self, result: Result<(), ActorError>) -> &mut DriverBuilder {
+            self.mock_actor
+                .expect_on_init()
+                .once()
+                .return_once(|_| result);
+
+            self
+        }
+
+        fn take(&mut self) -> Driver {
+            let mock_actor = Box::new(mem::take(&mut self.mock_actor));
+            let driver_config = mem::take(&mut self.driver_config);
+
+            Driver::new(driver_config, mock_actor)
+        }
+    }
+
     #[test]
-    fn test() {}
+    fn test_driver_start_node() {
+        let node_id = 1;
+        let instant = 100;
+
+        let driver_config = DriverConfig {
+            tick_period: 100,
+            snapshot_count: 10,
+        };
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .take();
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(Ok(()))
+            .take();
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+    }
 }
