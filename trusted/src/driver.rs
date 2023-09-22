@@ -908,13 +908,26 @@ impl Application for Driver {
 #[cfg(all(test, feature = "std"))]
 mod test {
     extern crate mockall;
+    extern crate spin;
 
+    use self::mockall::predicate::eq;
     use super::*;
     use mock::{MockActor, MockAttestation, MockHost};
     use model::ActorError;
 
     fn create_actor_config() -> Vec<u8> {
         Vec::new()
+    }
+    fn create_default_parameters() -> (u64, u64, DriverConfig) {
+        let node_id = 1;
+        let instant = 100;
+
+        let driver_config = DriverConfig {
+            tick_period: 100,
+            snapshot_count: 10,
+        };
+
+        (node_id, instant, driver_config)
     }
 
     fn create_start_node_request(leader: bool, node_id_hint: u64) -> MessageEnvelope {
@@ -929,6 +942,19 @@ mod test {
 
     fn create_start_node_response(node_id: u64) -> envelope_out::Msg {
         envelope_out::Msg::StartNode(StartNodeResponse { node_id })
+    }
+
+    fn create_execute_proposal_request(proposal_contents: Vec<u8>) -> MessageEnvelope {
+        let envelope = EnvelopeIn {
+            msg: Some(envelope_in::Msg::ExecuteProposal(ExecuteProposalRequest {
+                proposal_contents,
+            })),
+        };
+        envelope.encode_to_vec()
+    }
+
+    fn create_execute_proposal_response(result_contents: Vec<u8>) -> envelope_out::Msg {
+        envelope_out::Msg::ExecuteProposal(ExecuteProposalResponse { result_contents })
     }
 
     fn create_send_messages_matcher(
@@ -963,6 +989,14 @@ mod test {
             self.mock_attestation
                 .expect_public_signing_key()
                 .return_once(move || public_signing_key);
+            self
+        }
+
+        fn expect_get_self_config(&mut self, self_config: Vec<u8>) -> &mut MockHostBuilder {
+            self.mock_host
+                .expect_get_self_config()
+                .return_const(self_config);
+
             self
         }
 
@@ -1007,10 +1041,25 @@ mod test {
             }
         }
 
-        fn expect_on_init(&mut self, result: Result<(), ActorError>) -> &mut DriverBuilder {
+        fn expect_on_init(
+            &mut self,
+            init_handler: impl Fn(Box<dyn ActorContext>) -> Result<(), ActorError> + 'static,
+        ) -> &mut DriverBuilder {
             self.mock_actor
                 .expect_on_init()
-                .once()
+                .return_once_st(init_handler);
+
+            self
+        }
+
+        fn expect_on_process_command(
+            &mut self,
+            command: Vec<u8>,
+            result: Result<(), ActorError>,
+        ) -> &mut DriverBuilder {
+            self.mock_actor
+                .expect_on_process_command()
+                .with(eq(command))
                 .return_once(|_| result);
 
             self
@@ -1026,13 +1075,7 @@ mod test {
 
     #[test]
     fn test_driver_start_node() {
-        let node_id = 1;
-        let instant = 100;
-
-        let driver_config = DriverConfig {
-            tick_period: 100,
-            snapshot_count: 10,
-        };
+        let (node_id, instant, driver_config) = create_default_parameters();
 
         let mut mock_host = MockHostBuilder::new()
             .expect_public_signing_key(vec![])
@@ -1040,7 +1083,79 @@ mod test {
             .take();
 
         let mut driver = DriverBuilder::new(driver_config.clone())
-            .expect_on_init(Ok(()))
+            .expect_on_init(|_| Ok(()))
+            .take();
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+    }
+
+    #[test]
+    fn test_driver_execute_proposal() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+        let proposal_contents = vec![1, 2, 3];
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .expect_send_messages(vec![])
+            .take();
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(|_| Ok(()))
+            .expect_on_process_command(proposal_contents.clone(), Ok(()))
+            .take();
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant + 10,
+                Some(create_execute_proposal_request(proposal_contents.clone())),
+            )
+        );
+    }
+
+    #[test]
+    fn test_drive_actor_context() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+        let self_config = vec![1, 2, 3];
+
+        let proposal_response = vec![4, 5, 6];
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_get_self_config(self_config.clone())
+            .expect_send_messages(vec![
+                create_start_node_response(node_id),
+                create_execute_proposal_response(proposal_response.clone()),
+            ])
+            .take();
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(move |mut actor_context| {
+                assert_eq!(node_id, actor_context.id());
+                assert_eq!(instant, actor_context.instant());
+                assert_eq!(self_config, actor_context.config());
+                assert!(!actor_context.leader());
+                actor_context.send_message(proposal_response.clone());
+
+                Ok(())
+            })
             .take();
 
         assert_eq!(
