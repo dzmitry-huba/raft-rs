@@ -1,36 +1,28 @@
 #![allow(clippy::useless_conversion)]
+use crate::consensus::{Raft, RaftState, Store};
 use crate::endpoint::*;
 use crate::logger::{log::create_remote_logger, DrainOutput};
 use crate::model::{Actor, ActorContext};
-use crate::storage::MemoryStorage;
 use crate::util::raft::{
     create_raft_config_change, deserialize_config_change, deserialize_raft_message,
     get_config_state, get_metadata, serialize_raft_message,
 };
-use crate::util::raft::{
-    create_raft_config_state, create_raft_snapshot, create_raft_snapshot_metadata,
-};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
-use core::cell::RefMut;
-use core::cmp;
-use core::mem;
-use hashbrown::HashMap;
+use core::{
+    cell::{RefCell, RefMut},
+    cmp, mem,
+};
 use platform::{Application, Host, MessageEnvelope, PalError};
 use prost::Message;
-use raft::SoftState;
 use raft::{
     eraftpb::ConfChangeType as RaftConfigChangeType, eraftpb::ConfState as RaftConfigState,
-    eraftpb::Entry as RaftEntry, eraftpb::EntryType as RaftEntryType, eraftpb::HardState,
-    eraftpb::Message as RaftMessage, eraftpb::MessageType as RaftMessageType,
-    eraftpb::Snapshot as RaftSnapshot, Config as RaftConfig, Error as RaftError, RawNode,
-    StateRole as RaftStateRole,
+    eraftpb::Entry as RaftEntry, eraftpb::EntryType as RaftEntryType,
+    eraftpb::Message as RaftMessage, eraftpb::Snapshot as RaftSnapshot, Error as RaftError,
+    Storage as RaftStorage,
 };
 use slog::{debug, error, info, o, warn, Logger};
-type RaftNode = RawNode<MemoryStorage>;
 
 struct DriverContextCore {
     id: u64,
@@ -157,25 +149,6 @@ pub struct DriverConfig {
     pub snapshot_count: u64,
 }
 
-#[derive(PartialEq, Eq, Clone)]
-struct RaftState {
-    leader_node_id: u64,
-    leader_term: u64,
-    committed_cluster_config: Vec<u64>,
-    has_pending_change: bool,
-}
-
-impl RaftState {
-    fn new() -> RaftState {
-        RaftState {
-            leader_node_id: 0,
-            leader_term: 0,
-            committed_cluster_config: Vec::new(),
-            has_pending_change: false,
-        }
-    }
-}
-
 struct RaftProgress {
     applied_index: u64,
     config_state: RaftConfigState,
@@ -190,98 +163,69 @@ impl RaftProgress {
     }
 }
 
-pub struct Driver {
+pub struct Driver<R: Raft, S: Store, A: Actor> {
     core: Rc<RefCell<DriverContextCore>>,
-    actor: Box<dyn Actor>,
     driver_config: DriverConfig,
     driver_state: DriverState,
     messages: Vec<EnvelopeOut>,
-    heatbeat_messages: HashMap<u64, RaftMessage>,
-    raft_node_id: u64,
+    id: u64,
     instant: u64,
     tick_instant: u64,
     logger: Logger,
     logger_output: Box<dyn DrainOutput>,
-    raft_node: Option<Box<RaftNode>>,
+    raft: R,
+    store: Box<dyn FnMut(Logger, u64) -> S>,
+    actor: A,
     raft_state: RaftState,
     prev_raft_state: RaftState,
     raft_progress: RaftProgress,
 }
 
-impl Driver {
-    pub fn new(driver_config: DriverConfig, actor: Box<dyn Actor>) -> Self {
+impl<R: Raft<S = S>, S: Store + RaftStorage, A: Actor> Driver<R, S, A> {
+    pub fn new(
+        driver_config: DriverConfig,
+        raft: R,
+        store: Box<dyn FnMut(Logger, u64) -> S>,
+        actor: A,
+    ) -> Self {
         let (logger, logger_output) = create_remote_logger(0);
         Driver {
             core: Rc::new(RefCell::new(DriverContextCore::new())),
-            actor,
             driver_config,
             driver_state: DriverState::Created,
             messages: Vec::new(),
-            heatbeat_messages: HashMap::new(),
-            raft_node_id: 0,
+            id: 0,
             instant: 0,
             tick_instant: 0,
             logger,
             logger_output,
-            raft_node: None,
+            raft,
+            store,
+            actor,
             raft_state: RaftState::new(),
             prev_raft_state: RaftState::new(),
             raft_progress: RaftProgress::new(),
         }
     }
 
-    fn id(&self) -> u64 {
-        self.raft_node_id
-    }
-
     fn mut_core(&mut self) -> RefMut<'_, DriverContextCore> {
         self.core.borrow_mut()
     }
 
-    fn mut_raft_node(&mut self) -> &mut RaftNode {
-        self.raft_node
-            .as_mut()
-            .expect("Raft node is initialized")
-            .as_mut()
-    }
-
-    fn raft_node(&self) -> &RaftNode {
-        self.raft_node
-            .as_ref()
-            .expect("Raft node is initialized")
-            .as_ref()
-    }
-
     fn initilize_raft_node(&mut self, leader: bool) -> Result<(), PalError> {
-        let config = RaftConfig::new(self.id());
-
-        let mut storage =
-            MemoryStorage::new(self.logger.clone(), self.driver_config.snapshot_count);
-        if leader {
-            let snapshot = create_raft_snapshot(
-                create_raft_snapshot_metadata(1, 1, create_raft_config_state(vec![self.id()])),
-                Vec::new(),
-            );
-
-            storage.apply_snapshot(snapshot).map_err(|e| {
-                error!(
-                    self.logger,
-                    "Failed to apply Raft snapshot to storage: {}", e
-                );
-
-                // Failure to apply Raft snapshot to storage must lead to termination.
-                PalError::Storage
-            })?;
-        }
-
-        self.raft_node = Some(Box::new(
-            RawNode::new(&config, storage, &self.logger).map_err(|e| {
+        self.raft
+            .init(
+                self.id,
+                leader,
+                (self.store)(self.logger.clone(), self.driver_config.snapshot_count),
+                &self.logger,
+            )
+            .map_err(|e| {
                 error!(self.logger, "Failed to create Raft node: {}", e);
 
                 // Failure to create Raft node must lead to termination.
                 PalError::Raft
-            })?,
-        ));
+            })?;
 
         self.tick_instant = self.instant;
 
@@ -289,7 +233,7 @@ impl Driver {
     }
 
     fn check_raft_leadership(&self) -> bool {
-        self.raft_node.is_some() && self.raft_node().status().ss.raft_state == RaftStateRole::Leader
+        self.raft.leader()
     }
 
     fn make_raft_step(
@@ -308,7 +252,7 @@ impl Driver {
                 Ok(())
             }
             Ok(message) => {
-                if self.raft_node_id != recipient_node_id {
+                if self.id != recipient_node_id {
                     // Ignore incorrectly routed message
                     warn!(
                         self.logger,
@@ -325,7 +269,7 @@ impl Driver {
                 }
 
                 // Advance Raft internal state by one step.
-                match self.mut_raft_node().step(message) {
+                match self.raft.make_step(message) {
                     Err(e) => {
                         error!(self.logger, "Raft experienced unrecoverable error: {}", e);
 
@@ -341,9 +285,7 @@ impl Driver {
     fn make_raft_proposal(&mut self, proposal_contents: Vec<u8>) {
         debug!(self.logger, "Making Raft proposal");
 
-        self.mut_raft_node()
-            .propose(vec![], proposal_contents)
-            .unwrap();
+        self.raft.make_proposal(proposal_contents).unwrap();
     }
 
     fn make_raft_config_change_proposal(
@@ -354,10 +296,7 @@ impl Driver {
         debug!(self.logger, "Making Raft config change proposal");
 
         let config_change = create_raft_config_change(node_id, change_type);
-        match self
-            .mut_raft_node()
-            .propose_conf_change(vec![], config_change)
-        {
+        match self.raft.make_config_change_proposal(config_change) {
             Ok(_) => Ok(ChangeClusterStatus::ChangeStatusPending),
             Err(RaftError::ProposalDropped) => {
                 warn!(self.logger, "Dropping Raft config change proposal");
@@ -379,7 +318,7 @@ impl Driver {
         if self.instant - self.tick_instant >= self.driver_config.tick_period {
             self.tick_instant = self.instant;
             // invoke Raft tick to trigger timer based changes.
-            self.mut_raft_node().tick();
+            self.raft.make_tick();
         }
     }
 
@@ -416,7 +355,7 @@ impl Driver {
                     "Applying Raft config change entry: {:?}", config_change
                 );
 
-                match self.mut_raft_node().apply_conf_change(&config_change) {
+                match self.raft.apply_config_change(&config_change) {
                     Err(e) => {
                         error!(self.logger, "Failed to apply Raft config change: {}", e);
                         // Failure to apply Raft config change must lead to termination.
@@ -448,20 +387,10 @@ impl Driver {
 
     fn send_raft_messages(&mut self, raft_messages: Vec<RaftMessage>) -> Result<(), PalError> {
         for raft_message in raft_messages {
-            // Try to dedup numerous heatbeat messages to the same recipient.
-            if raft_message.msg_type == RaftMessageType::MsgHeartbeat.into() {
-                if self.heatbeat_messages.contains_key(&raft_message.to)
-                    && self.heatbeat_messages[&raft_message.to] == raft_message
-                {
-                    continue;
-                }
-                self.heatbeat_messages
-                    .insert(raft_message.to, raft_message.clone());
-            }
             // Buffer message to be sent out.
             self.stash_message(envelope_out::Msg::DeliverMessage(DeliverMessage {
                 recipient_node_id: raft_message.to,
-                sender_node_id: self.id(),
+                sender_node_id: self.id,
                 message_contents: serialize_raft_message(&raft_message).unwrap(),
             }));
         }
@@ -484,10 +413,7 @@ impl Driver {
         self.collect_config_state(get_config_state(raft_snapshot).clone());
 
         // Persist unstable snapshot received from a peer into the stable storage.
-        let apply_result = self
-            .mut_raft_node()
-            .mut_store()
-            .apply_snapshot(raft_snapshot.clone());
+        let apply_result = self.raft.mut_store().apply_snapshot(raft_snapshot.clone());
         if let Err(e) = apply_result {
             error!(
                 self.logger,
@@ -513,7 +439,7 @@ impl Driver {
     }
 
     fn maybe_create_raft_snapshot(&mut self) -> Result<(), PalError> {
-        if !self.raft_node().store().should_snapshot(
+        if !self.raft.mut_store().should_snapshot(
             self.raft_progress.applied_index,
             &self.raft_progress.config_state,
         ) {
@@ -528,7 +454,7 @@ impl Driver {
 
         let applied_index = self.raft_progress.applied_index;
         let config_state = self.raft_progress.config_state.clone();
-        self.mut_raft_node()
+        self.raft
             .mut_store()
             .create_snapshot(applied_index, config_state, snapshot_data)
             .map_err(|e| {
@@ -542,19 +468,19 @@ impl Driver {
         // Given that instant only set once trigger Raft tick once as well.
         self.trigger_raft_tick();
 
-        if !self.raft_node().has_ready() {
+        if !self.raft.has_ready() {
             // There is nothing process.
             return Ok(());
         }
 
-        let mut raft_ready = self.mut_raft_node().ready();
+        let mut raft_ready = self.raft.get_ready();
 
         // Send out messages to the peers.
         self.send_raft_messages(raft_ready.take_messages())?;
 
         if let Some(raft_hard_state) = raft_ready.hs() {
             // Persist changed hard state into the stable storage.
-            self.mut_raft_node()
+            self.raft
                 .mut_store()
                 .set_hard_state(raft_hard_state.clone());
         }
@@ -571,10 +497,7 @@ impl Driver {
 
         if !raft_ready.entries().is_empty() {
             // Persist unstable entries into the stable storage.
-            let append_result = self
-                .mut_raft_node()
-                .mut_store()
-                .append_entries(raft_ready.entries());
+            let append_result = self.raft.mut_store().append_entries(raft_ready.entries());
             if let Err(e) = append_result {
                 error!(
                     self.logger,
@@ -586,14 +509,14 @@ impl Driver {
         }
 
         // Advance Raft state after fully processing ready.
-        let mut light_raft_ready: raft::LightReady = self.mut_raft_node().advance(raft_ready);
+        let mut light_raft_ready: raft::LightReady = self.raft.advance_ready(raft_ready);
 
         // Send out messages to the peers.
         self.send_raft_messages(light_raft_ready.take_messages())?;
         // Apply all committed entries.
         self.apply_raft_committed_entries(light_raft_ready.take_committed_entries())?;
         // Advance the apply index.
-        self.mut_raft_node().advance_apply();
+        self.raft.advance_apply();
 
         Ok(())
     }
@@ -608,18 +531,9 @@ impl Driver {
     }
 
     fn stash_leader_state(&mut self) {
-        let raft_hard_state: HardState;
-        let raft_soft_state: SoftState;
-        {
-            let raft_status = self.raft_node().status();
-            raft_hard_state = raft_status.hs;
-            raft_soft_state = raft_status.ss;
-        }
-        if raft_soft_state.raft_state == RaftStateRole::Leader {
-            self.raft_state.leader_node_id = raft_soft_state.leader_id;
-            self.raft_state.leader_term = raft_hard_state.term;
-            self.raft_state.has_pending_change = self.raft_node().raft.has_pending_conf();
-        }
+        let mut raft_state = self.raft.state();
+        raft_state.committed_cluster_config = self.raft_state.committed_cluster_config.clone();
+        self.raft_state = raft_state;
 
         if self.prev_raft_state == self.raft_state {
             return;
@@ -663,8 +577,8 @@ impl Driver {
     ) {
         let id = node_id_hint;
         self.mut_core().set_immutable_state(id, app_config);
-        self.raft_node_id = id;
-        (self.logger, self.logger_output) = create_remote_logger(self.raft_node_id);
+        self.id = id;
+        (self.logger, self.logger_output) = create_remote_logger(self.id);
     }
 
     fn process_start_node(
@@ -694,7 +608,7 @@ impl Driver {
         self.driver_state = DriverState::Started;
 
         self.stash_message(envelope_out::Msg::StartNode(StartNodeResponse {
-            node_id: self.id(),
+            node_id: self.id,
         }));
 
         Ok(())
@@ -708,6 +622,8 @@ impl Driver {
         self.actor.on_shutdown();
 
         self.driver_state = DriverState::Stopped;
+
+        self.stash_message(envelope_out::Msg::StopNode(StopNodeResponse {}));
 
         Ok(())
     }
@@ -798,7 +714,7 @@ impl Driver {
     }
 
     fn process_state_machine(&mut self) -> Result<Vec<EnvelopeOut>, PalError> {
-        if self.raft_node.is_some() {
+        if self.raft.initialized() {
             // Advance Raft internal state.
             self.advance_raft()?;
 
@@ -811,7 +727,6 @@ impl Driver {
 
         self.stash_log_entries();
 
-        self.heatbeat_messages.clear();
         // Take messages to be sent out.
         Ok(mem::take(&mut self.messages))
     }
@@ -837,7 +752,7 @@ impl Driver {
     }
 }
 
-impl Application for Driver {
+impl<R: Raft<S = S>, S: Store + RaftStorage, A: Actor> Application for Driver<R, S, A> {
     /// Handles messages received from the trusted host.
     fn receive_message(
         &mut self,
@@ -912,7 +827,7 @@ mod test {
 
     use self::mockall::predicate::eq;
     use super::*;
-    use mock::{MockActor, MockAttestation, MockHost};
+    use mock::{MockActor, MockAttestation, MockHost, MockRaft, MockStore};
     use model::ActorError;
 
     fn create_actor_config() -> Vec<u8> {
@@ -930,6 +845,15 @@ mod test {
         (node_id, instant, driver_config)
     }
 
+    fn create_default_raft_state(node_id: u64) -> RaftState {
+        RaftState {
+            leader_node_id: node_id,
+            leader_term: 1,
+            committed_cluster_config: vec![node_id],
+            has_pending_change: false,
+        }
+    }
+
     fn create_start_node_request(leader: bool, node_id_hint: u64) -> MessageEnvelope {
         let envelope = EnvelopeIn {
             msg: Some(envelope_in::Msg::StartNode(StartNodeRequest {
@@ -942,6 +866,17 @@ mod test {
 
     fn create_start_node_response(node_id: u64) -> envelope_out::Msg {
         envelope_out::Msg::StartNode(StartNodeResponse { node_id })
+    }
+
+    fn create_stop_node_request() -> MessageEnvelope {
+        let envelope = EnvelopeIn {
+            msg: Some(envelope_in::Msg::StopNode(StopNodeRequest {})),
+        };
+        envelope.encode_to_vec()
+    }
+
+    fn create_stop_node_response() -> envelope_out::Msg {
+        envelope_out::Msg::StopNode(StopNodeResponse {})
     }
 
     fn create_execute_proposal_request(proposal_contents: Vec<u8>) -> MessageEnvelope {
@@ -1028,6 +963,62 @@ mod test {
         }
     }
 
+    struct RaftBuilder {
+        mock_store: MockStore,
+        mock_raft: MockRaft<MockStore>,
+    }
+
+    impl RaftBuilder {
+        fn new() -> RaftBuilder {
+            RaftBuilder {
+                mock_store: MockStore::new(),
+                mock_raft: MockRaft::new(),
+            }
+        }
+
+        fn expect_leader(mut self, leader: bool) -> RaftBuilder {
+            self.mock_raft.expect_leader().return_const(leader);
+
+            self
+        }
+
+        fn expect_init(
+            mut self,
+            init_handler: impl Fn(u64, bool, MockStore, &Logger) -> Result<(), RaftError> + 'static,
+        ) -> RaftBuilder {
+            self.mock_raft.expect_init().return_once_st(init_handler);
+            self.mock_raft.expect_initialized().returning(|| true);
+
+            self
+        }
+
+        fn expect_has_ready(mut self, has_ready: bool) -> RaftBuilder {
+            self.mock_raft.expect_has_ready().return_const(has_ready);
+            self
+        }
+
+        fn expect_should_snapshot(mut self, should_snapshot: bool) -> RaftBuilder {
+            self.mock_store
+                .expect_should_snapshot()
+                .return_const(should_snapshot);
+            self
+        }
+
+        fn expect_state(mut self, raft_state: &RaftState) -> RaftBuilder {
+            self.mock_raft
+                .expect_state()
+                .return_const(raft_state.clone());
+            self
+        }
+
+        fn take(&mut self) -> (MockStore, MockRaft<MockStore>) {
+            (
+                mem::take(&mut self.mock_store),
+                mem::take(&mut self.mock_raft),
+            )
+        }
+    }
+
     struct DriverBuilder {
         mock_actor: MockActor,
         driver_config: DriverConfig,
@@ -1052,6 +1043,17 @@ mod test {
             self
         }
 
+        fn expect_on_shutdown(
+            &mut self,
+            shutdown_handler: impl Fn() + 'static,
+        ) -> &mut DriverBuilder {
+            self.mock_actor
+                .expect_on_shutdown()
+                .return_once_st(shutdown_handler);
+
+            self
+        }
+
         fn expect_on_process_command(
             &mut self,
             command: Vec<u8>,
@@ -1065,11 +1067,22 @@ mod test {
             self
         }
 
-        fn take(&mut self) -> Driver {
-            let mock_actor = Box::new(mem::take(&mut self.mock_actor));
+        fn take(
+            &mut self,
+            mut raft_builder: RaftBuilder,
+        ) -> Driver<MockRaft<MockStore>, MockStore, MockActor> {
+            let (mock_store, mut mock_raft) = raft_builder.take();
+            let mock_actor = mem::take(&mut self.mock_actor);
             let driver_config = mem::take(&mut self.driver_config);
 
-            Driver::new(driver_config, mock_actor)
+            mock_raft.expect_mut_store().return_var(mock_store);
+
+            Driver::new(
+                driver_config,
+                mock_raft,
+                Box::new(|_, _| MockStore::new()),
+                mock_actor,
+            )
         }
     }
 
@@ -1082,9 +1095,20 @@ mod test {
             .expect_send_messages(vec![create_start_node_response(node_id)])
             .take();
 
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(move |id, leader, _, _| {
+                assert_eq!(node_id, id);
+                assert!(leader);
+                Ok(())
+            })
+            .expect_has_ready(false)
+            .expect_should_snapshot(false)
+            .expect_state(&create_default_raft_state(node_id));
+
         let mut driver = DriverBuilder::new(driver_config.clone())
             .expect_on_init(|_| Ok(()))
-            .take();
+            .take(raft_builder);
 
         assert_eq!(
             Ok(()),
@@ -1092,6 +1116,47 @@ mod test {
                 &mut mock_host,
                 instant,
                 Some(create_start_node_request(true, node_id)),
+            )
+        );
+    }
+
+    #[test]
+    fn test_driver_stop_node() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .expect_send_messages(vec![create_stop_node_response()])
+            .take();
+
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
+            .expect_should_snapshot(false)
+            .expect_state(&create_default_raft_state(node_id));
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(|_| Ok(()))
+            .expect_on_shutdown(|| ())
+            .take(raft_builder);
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant + 10,
+                Some(create_stop_node_request()),
             )
         );
     }
@@ -1107,10 +1172,17 @@ mod test {
             .expect_send_messages(vec![])
             .take();
 
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
+            .expect_should_snapshot(false)
+            .expect_state(&create_default_raft_state(node_id));
+
         let mut driver = DriverBuilder::new(driver_config.clone())
             .expect_on_init(|_| Ok(()))
             .expect_on_process_command(proposal_contents.clone(), Ok(()))
-            .take();
+            .take(raft_builder);
 
         assert_eq!(
             Ok(()),
@@ -1132,7 +1204,7 @@ mod test {
     }
 
     #[test]
-    fn test_drive_actor_context() {
+    fn test_driver_actor_context() {
         let (node_id, instant, driver_config) = create_default_parameters();
         let self_config = vec![1, 2, 3];
 
@@ -1146,6 +1218,13 @@ mod test {
             ])
             .take();
 
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
+            .expect_should_snapshot(false)
+            .expect_state(&create_default_raft_state(node_id));
+
         let mut driver = DriverBuilder::new(driver_config.clone())
             .expect_on_init(move |mut actor_context| {
                 assert_eq!(node_id, actor_context.id());
@@ -1156,7 +1235,7 @@ mod test {
 
                 Ok(())
             })
-            .take();
+            .take(raft_builder);
 
         assert_eq!(
             Ok(()),

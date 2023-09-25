@@ -23,10 +23,12 @@ use hashbrown::HashMap;
 use prost::Message;
 use slog::{debug, warn};
 use trusted::{
+    consensus::RaftSimple,
     driver::{Driver, DriverConfig},
     endpoint::*,
     model::{Actor, ActorContext, ActorError},
     platform::{Application, Attestation, Host, MessageEnvelope, PalError},
+    storage::MemoryStorage,
 };
 
 struct CounterActor {
@@ -445,7 +447,7 @@ struct FakePlatform {
     id: u64,
     messages_in: Vec<EnvelopeIn>,
     instant: u64,
-    driver: RefCell<Driver>,
+    driver: RefCell<Driver<RaftSimple<MemoryStorage>, MemoryStorage, CounterActor>>,
     host: RefCell<FakeHost>,
 }
 
@@ -460,7 +462,9 @@ impl FakePlatform {
                     tick_period: 10,
                     snapshot_count: 1000,
                 },
-                Box::new(CounterActor::new()),
+                RaftSimple::new(),
+                Box::new(MemoryStorage::new),
+                CounterActor::new(),
             )),
             host: RefCell::new(FakeHost::new()),
         }

@@ -1,6 +1,11 @@
-use crate::util::raft::{
-    config_state_contains_node, create_raft_config_state, create_raft_snapshot,
-    create_raft_snapshot_metadata, get_config_state, get_metadata,
+#![allow(dead_code)]
+
+use crate::{
+    consensus::Store,
+    util::raft::{
+        config_state_contains_node, create_raft_config_state, create_raft_snapshot,
+        create_raft_snapshot_metadata, get_config_state, get_metadata,
+    },
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -326,21 +331,6 @@ impl MemoryStorage {
         }
     }
 
-    /// Saves the current Raft hard state.
-    pub fn set_hard_state(&mut self, state: RaftHardState) {
-        self.core.borrow_mut().set_hard_state(state);
-    }
-
-    /// Append the new entries to storage.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `entries` contains compacted entries, or there's a gap between `entries`
-    /// and the last received entry in the storage.
-    pub fn append_entries(&mut self, entries: &[RaftEntry]) -> Result<(), RaftError> {
-        self.core.borrow_mut().append_entries(entries)
-    }
-
     /// Discards all log entries prior to compact_index.
     /// It is the application's responsibility to not attempt to compact an index
     /// greater than RaftLog.applied.
@@ -348,21 +338,25 @@ impl MemoryStorage {
     /// # Panics
     ///
     /// Panics if `compact_index` is higher than `Storage::last_index(&self) + 1`.
-    pub fn compact_entries(&mut self, compact_index: u64) -> Result<(), RaftError> {
+    fn compact_entries(&mut self, compact_index: u64) -> Result<(), RaftError> {
         self.core.borrow_mut().compact_entries(compact_index)
     }
+}
 
-    /// Overwrites the contents of this Storage object with those of the given snapshot.
-    pub fn apply_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), RaftError> {
+impl Store for MemoryStorage {
+    fn set_hard_state(&mut self, state: RaftHardState) {
+        self.core.borrow_mut().set_hard_state(state);
+    }
+
+    fn append_entries(&mut self, entries: &[RaftEntry]) -> Result<(), RaftError> {
+        self.core.borrow_mut().append_entries(entries)
+    }
+
+    fn apply_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), RaftError> {
         self.core.borrow_mut().apply_snapshot(snapshot)
     }
 
-    /// CreateSnapshot makes a snapshot which can be retrieved with Snapshot() and
-    /// can be used to reconstruct the state at that point.
-    ///
-    /// If any configuration changes have been made since the last compaction,
-    /// the result of the last ApplyConfChange must be passed in.
-    pub fn create_snapshot(
+    fn create_snapshot(
         &mut self,
         applied_index: u64,
         config_state: RaftConfigState,
@@ -373,8 +367,7 @@ impl MemoryStorage {
             .create_snapshot(applied_index, config_state, snapshot_data)
     }
 
-    /// Checks if snapshotting at given index is desirable.
-    pub fn should_snapshot(&self, applied_index: u64, config_state: &RaftConfigState) -> bool {
+    fn should_snapshot(&self, applied_index: u64, config_state: &RaftConfigState) -> bool {
         self.core
             .borrow()
             .should_snapshot(applied_index, config_state)

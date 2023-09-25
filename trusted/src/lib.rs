@@ -14,6 +14,7 @@ pub mod endpoint {
     include!(concat!(env!("OUT_DIR"), "/endpoint.rs"));
 }
 
+pub mod consensus;
 pub mod driver;
 pub mod logger;
 #[cfg(all(test, feature = "std"))]
