@@ -3,15 +3,14 @@ extern crate mockall;
 
 use self::mockall::mock;
 use consensus;
-use consensus::{Raft, Store};
+use consensus::{Raft, RaftLightReady, RaftReady, Store};
 use model::{Actor, ActorContext, ActorError};
 use platform::{Attestation, Host, MessageEnvelope, PalError};
 use raft::{
     eraftpb::ConfChange as RaftConfigChange, eraftpb::ConfState as RaftConfigState,
     eraftpb::Entry as RaftEntry, eraftpb::HardState as RaftHardState,
     eraftpb::Message as RaftMessage, eraftpb::Snapshot as RaftSnapshot, Error as RaftError,
-    GetEntriesContext as RaftGetEntriesContext, LightReady as RaftLightReady, Ready as RaftReady,
-    Storage as RaftStorage,
+    GetEntriesContext as RaftGetEntriesContext, Storage as RaftStorage,
 };
 use slog::Logger;
 

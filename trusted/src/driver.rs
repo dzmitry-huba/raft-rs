@@ -480,7 +480,7 @@ impl<R: Raft<S = S>, S: Store + RaftStorage, A: Actor> Driver<R, S, A> {
         // Send out messages to the peers.
         self.send_raft_messages(raft_ready.take_messages())?;
 
-        if let Some(raft_hard_state) = raft_ready.hs() {
+        if let Some(raft_hard_state) = raft_ready.hard_state() {
             // Persist changed hard state into the stable storage.
             self.raft
                 .mut_store()
@@ -497,9 +497,10 @@ impl<R: Raft<S = S>, S: Store + RaftStorage, A: Actor> Driver<R, S, A> {
         // and snapshot to the stable storage.
         self.send_raft_messages(raft_ready.take_persisted_messages())?;
 
-        if !raft_ready.entries().is_empty() {
+        let entries = raft_ready.take_entries();
+        if !entries.is_empty() {
             // Persist unstable entries into the stable storage.
-            let append_result = self.raft.mut_store().append_entries(raft_ready.entries());
+            let append_result = self.raft.mut_store().append_entries(entries.as_ref());
             if let Err(e) = append_result {
                 error!(
                     self.logger,
@@ -511,7 +512,7 @@ impl<R: Raft<S = S>, S: Store + RaftStorage, A: Actor> Driver<R, S, A> {
         }
 
         // Advance Raft state after fully processing ready.
-        let mut light_raft_ready: raft::LightReady = self.raft.advance_ready(raft_ready);
+        let mut light_raft_ready = self.raft.advance_ready(raft_ready);
 
         // Send out messages to the peers.
         self.send_raft_messages(light_raft_ready.take_messages())?;
@@ -824,11 +825,13 @@ mod test {
     extern crate mockall;
     extern crate spin;
 
+    use crate::consensus::RaftReady;
+
     use self::mockall::predicate::eq;
     use super::*;
     use mock::{MockActor, MockAttestation, MockHost, MockRaft, MockStore};
     use model::ActorError;
-    use raft::{eraftpb::ConfChange as RaftConfigChange, Ready as RaftReady};
+    use raft::eraftpb::ConfChange as RaftConfigChange;
 
     fn create_actor_config() -> Vec<u8> {
         Vec::new()

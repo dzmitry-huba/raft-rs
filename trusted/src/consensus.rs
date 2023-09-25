@@ -1,13 +1,15 @@
+use core::mem;
+
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use raft::{
     eraftpb::ConfChange as RaftConfigChange, eraftpb::ConfState as RaftConfigState,
     eraftpb::Entry as RaftEntry, eraftpb::HardState as RaftHardState,
     eraftpb::Message as RaftMessage, eraftpb::Snapshot as RaftSnapshot, Config as RaftConfig,
-    Error as RaftError, LightReady as RaftLightReady, RawNode as RaftNode, RawNode,
-    Ready as RaftReady, SoftState as RaftSoftState, StateRole as RaftStateRole,
-    Storage as RaftStorage,
+    Error as RaftError, RawNode as RaftNode, RawNode, Ready, SoftState as RaftSoftState,
+    StateRole as RaftStateRole, Storage as RaftStorage,
 };
 use slog::Logger;
 
@@ -62,6 +64,89 @@ impl RaftState {
     }
 }
 
+#[derive(Default)]
+pub struct RaftReady {
+    messages: Vec<RaftMessage>,
+    persisted_messages: Vec<RaftMessage>,
+    entries: Vec<RaftEntry>,
+    committed_entries: Vec<RaftEntry>,
+    hard_state: Option<RaftHardState>,
+    snapshot: RaftSnapshot,
+    number: u64,
+}
+
+impl RaftReady {
+    pub fn new(
+        messages: Vec<RaftMessage>,
+        persisted_messages: Vec<RaftMessage>,
+        entries: Vec<RaftEntry>,
+        committed_entries: Vec<RaftEntry>,
+        hard_state: Option<RaftHardState>,
+        snapshot: RaftSnapshot,
+        number: u64,
+    ) -> RaftReady {
+        RaftReady {
+            messages,
+            persisted_messages,
+            entries,
+            committed_entries,
+            hard_state,
+            snapshot,
+            number,
+        }
+    }
+
+    pub fn take_messages(&mut self) -> Vec<RaftMessage> {
+        mem::take(&mut self.messages)
+    }
+
+    pub fn take_persisted_messages(&mut self) -> Vec<RaftMessage> {
+        mem::take(&mut self.persisted_messages)
+    }
+
+    pub fn take_entries(&mut self) -> Vec<RaftEntry> {
+        mem::take(&mut self.entries)
+    }
+
+    pub fn take_committed_entries(&mut self) -> Vec<RaftEntry> {
+        mem::take(&mut self.committed_entries)
+    }
+
+    pub fn hard_state(&self) -> Option<&RaftHardState> {
+        self.hard_state.as_ref()
+    }
+
+    pub fn snapshot(&self) -> &RaftSnapshot {
+        &self.snapshot
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+}
+
+pub struct RaftLightReady {
+    messages: Vec<RaftMessage>,
+    committed_entries: Vec<RaftEntry>,
+}
+
+impl RaftLightReady {
+    pub fn new(messages: Vec<RaftMessage>, committed_entries: Vec<RaftEntry>) -> RaftLightReady {
+        RaftLightReady {
+            messages,
+            committed_entries,
+        }
+    }
+
+    pub fn take_messages(&mut self) -> Vec<RaftMessage> {
+        mem::take(&mut self.messages)
+    }
+
+    pub fn take_committed_entries(&mut self) -> Vec<RaftEntry> {
+        mem::take(&mut self.committed_entries)
+    }
+}
+
 pub trait Raft {
     type S: Store + RaftStorage;
 
@@ -109,6 +194,7 @@ pub trait Raft {
 #[derive(Default)]
 pub struct RaftSimple<S: Store + RaftStorage> {
     raft_node: Option<Box<RaftNode<S>>>,
+    raft_ready: HashMap<u64, Ready>,
     committed_voters: Vec<u64>,
 }
 
@@ -116,6 +202,7 @@ impl<S: Store + RaftStorage> RaftSimple<S> {
     pub fn new() -> RaftSimple<S> {
         RaftSimple {
             raft_node: None,
+            raft_ready: HashMap::new(),
             committed_voters: Vec::new(),
         }
     }
@@ -230,11 +317,30 @@ impl<S: Store + RaftStorage> Raft for RaftSimple<S> {
     }
 
     fn get_ready(&mut self) -> RaftReady {
-        self.mut_raft_node().ready()
+        let mut ready = self.mut_raft_node().ready();
+        let raft_ready = RaftReady::new(
+            ready.take_messages(),
+            ready.take_persisted_messages(),
+            ready.take_entries(),
+            ready.take_committed_entries(),
+            ready.hs().cloned(),
+            // Cloning of the snapshot is unfortunate here, will address this later.
+            ready.snapshot().clone(),
+            ready.number(),
+        );
+
+        self.raft_ready.insert(ready.number(), ready);
+
+        raft_ready
     }
 
-    fn advance_ready(&mut self, ready: RaftReady) -> RaftLightReady {
-        self.mut_raft_node().advance(ready)
+    fn advance_ready(&mut self, raft_ready: RaftReady) -> RaftLightReady {
+        let ready = self.raft_ready.remove(&raft_ready.number()).unwrap();
+        let mut light_ready = self.mut_raft_node().advance(ready);
+        RaftLightReady::new(
+            light_ready.take_messages(),
+            light_ready.take_committed_entries(),
+        )
     }
 
     fn advance_apply(&mut self) {
