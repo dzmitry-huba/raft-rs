@@ -109,11 +109,15 @@ pub trait Raft {
 #[derive(Default)]
 pub struct RaftSimple<S: Store + RaftStorage> {
     raft_node: Option<Box<RaftNode<S>>>,
+    committed_voters: Vec<u64>,
 }
 
 impl<S: Store + RaftStorage> RaftSimple<S> {
     pub fn new() -> RaftSimple<S> {
-        RaftSimple { raft_node: None }
+        RaftSimple {
+            raft_node: None,
+            committed_voters: Vec::new(),
+        }
     }
 
     fn mut_raft_node(&mut self) -> &mut RaftNode<S> {
@@ -156,6 +160,7 @@ impl<S: Store + RaftStorage> Raft for RaftSimple<S> {
             state.leader_node_id = raft_soft_state.leader_id;
             state.leader_term = raft_hard_state.term;
             state.has_pending_change = self.raft_node().raft.has_pending_conf();
+            state.committed_cluster_config = self.committed_voters.clone();
         }
 
         state
@@ -181,6 +186,7 @@ impl<S: Store + RaftStorage> Raft for RaftSimple<S> {
             );
 
             store.apply_snapshot(snapshot)?;
+            self.committed_voters = vec![node_id];
         }
 
         self.raft_node = Some(Box::new(RawNode::new(&config, store, logger)?));
@@ -212,7 +218,11 @@ impl<S: Store + RaftStorage> Raft for RaftSimple<S> {
         &mut self,
         config_change: &RaftConfigChange,
     ) -> Result<RaftConfigState, RaftError> {
-        self.mut_raft_node().apply_conf_change(config_change)
+        let config_state = self.mut_raft_node().apply_conf_change(config_change);
+        if let Ok(config_state) = &config_state {
+            self.committed_voters = config_state.voters.clone();
+        }
+        config_state
     }
 
     fn has_ready(&self) -> bool {
