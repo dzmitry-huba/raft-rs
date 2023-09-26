@@ -941,7 +941,18 @@ mod test {
         })
     }
 
-    fn create_deliver_message(raft_message: &RaftMessage) -> envelope_out::Msg {
+    fn create_deliver_message_request(raft_message: &RaftMessage) -> MessageEnvelope {
+        let envelope = EnvelopeIn {
+            msg: Some(envelope_in::Msg::DeliverMessage(DeliverMessage {
+                recipient_node_id: raft_message.to,
+                sender_node_id: raft_message.from,
+                message_contents: serialize_raft_message(raft_message).unwrap(),
+            })),
+        };
+        envelope.encode_to_vec()
+    }
+
+    fn create_deliver_message_response(raft_message: &RaftMessage) -> envelope_out::Msg {
         envelope_out::Msg::DeliverMessage(DeliverMessage {
             recipient_node_id: raft_message.to,
             sender_node_id: raft_message.from,
@@ -1086,6 +1097,41 @@ mod test {
             self
         }
 
+        fn expect_create_snapshot(
+            mut self,
+            applied_index: u64,
+            config_state: RaftConfigState,
+            snapshot_data: &[u8],
+            result: Result<(), RaftError>,
+        ) -> RaftBuilder {
+            self.mock_store
+                .expect_create_snapshot()
+                .with(
+                    eq(applied_index),
+                    eq(config_state),
+                    eq(snapshot_data.to_owned()),
+                )
+                .return_once_st(|_, _, _| result);
+            self
+        }
+
+        fn expect_make_tick(mut self) -> RaftBuilder {
+            self.mock_raft.expect_make_tick().once().return_const(());
+            self
+        }
+
+        fn expect_make_step(
+            mut self,
+            raft_message: &RaftMessage,
+            result: Result<(), RaftError>,
+        ) -> RaftBuilder {
+            self.mock_raft
+                .expect_make_step()
+                .with(eq(raft_message.clone()))
+                .return_once_st(move |_| result);
+            self
+        }
+
         fn expect_has_ready(mut self, has_ready: bool) -> RaftBuilder {
             self.mock_raft
                 .expect_has_ready()
@@ -1210,7 +1256,7 @@ mod test {
             self
         }
 
-        fn expect_no_load_snapshot(
+        fn expect_on_load_snapshot(
             &mut self,
             snapshot: Vec<u8>,
             result: Result<(), ActorError>,
@@ -1219,6 +1265,16 @@ mod test {
                 .expect_on_load_snapshot()
                 .with(eq(snapshot))
                 .return_once(|_| result);
+            self
+        }
+
+        fn expect_on_save_snapshot(
+            &mut self,
+            result: Result<Vec<u8>, ActorError>,
+        ) -> &mut DriverBuilder {
+            self.mock_actor
+                .expect_on_save_snapshot()
+                .return_once(|| result);
             self
         }
 
@@ -1568,8 +1624,8 @@ mod test {
             .expect_public_signing_key(vec![])
             .expect_send_messages(vec![create_start_node_response(node_id)])
             .expect_send_messages(vec![
-                create_deliver_message(&message_a),
-                create_deliver_message(&message_b),
+                create_deliver_message_response(&message_a),
+                create_deliver_message_response(&message_b),
             ])
             .take();
 
@@ -1589,12 +1645,170 @@ mod test {
 
         let mut driver = DriverBuilder::new(driver_config.clone())
             .expect_on_init(|_| Ok(()))
-            .expect_no_load_snapshot(snapshot.data.to_vec(), Ok(()))
+            .expect_on_load_snapshot(snapshot.data.to_vec(), Ok(()))
             .expect_on_apply_event(
                 committed_normal_entry.index,
                 committed_normal_entry.data.to_vec(),
                 Ok(()),
             )
+            .take(raft_builder);
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(&mut mock_host, instant + 10, None)
+        );
+    }
+
+    #[test]
+    fn test_driver_raft_tick() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+
+        let raft_state = create_default_raft_state(node_id);
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .expect_send_messages(vec![])
+            .take();
+
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
+            .expect_has_ready(false)
+            .expect_should_snapshot(false)
+            .expect_state(&raft_state)
+            .expect_make_tick();
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(|_| Ok(()))
+            .take(raft_builder);
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(&mut mock_host, instant + driver_config.tick_period, None,)
+        );
+    }
+
+    #[test]
+    fn test_driver_raft_step() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+        let peer_id = 2;
+
+        let raft_state = create_default_raft_state(node_id);
+
+        let message_a = create_raft_message(node_id, peer_id, RaftMessageType::MsgBeat);
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .expect_send_messages(vec![])
+            .take();
+
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
+            .expect_has_ready(false)
+            .expect_should_snapshot(false)
+            .expect_state(&raft_state)
+            .expect_make_step(&message_a, Ok(()));
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(|_| Ok(()))
+            .take(raft_builder);
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant + 10,
+                Some(create_deliver_message_request(&message_a)),
+            )
+        );
+    }
+
+    #[test]
+    fn test_driver_trigger_snapshot() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+
+        let raft_state = create_default_raft_state(node_id);
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .expect_send_messages(vec![])
+            .take();
+
+        let committed_normal_entry =
+            create_raft_entry(2, 2, RaftEntryType::EntryNormal, vec![1, 2, 3]);
+
+        let ready = RaftReady::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![committed_normal_entry.clone()],
+            None,
+            RaftSnapshot::default(),
+            1,
+        );
+        let light_ready = RaftLightReady::default();
+
+        let snapshot = vec![4, 5, 6];
+
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
+            .expect_has_ready(true)
+            .expect_ready(&ready)
+            .expect_should_snapshot(false)
+            .expect_should_snapshot(true)
+            .expect_create_snapshot(
+                committed_normal_entry.index,
+                create_raft_config_state(raft_state.committed_cluster_config.clone()),
+                &snapshot,
+                Ok(()),
+            )
+            .expect_state(&raft_state)
+            .expect_advance_ready(ready.number(), light_ready)
+            .expect_advance_apply();
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(|_| Ok(()))
+            .expect_on_apply_event(
+                committed_normal_entry.index,
+                committed_normal_entry.data.to_vec(),
+                Ok(()),
+            )
+            .expect_on_save_snapshot(Ok(snapshot.clone()))
             .take(raft_builder);
 
         assert_eq!(
