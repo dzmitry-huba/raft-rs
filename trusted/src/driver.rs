@@ -825,13 +825,22 @@ mod test {
     extern crate mockall;
     extern crate spin;
 
-    use crate::consensus::RaftReady;
+    use crate::{
+        consensus::{RaftLightReady, RaftReady},
+        util::raft::{
+            create_empty_raft_entry, create_raft_config_state, create_raft_entry,
+            create_raft_message, create_raft_snapshot, create_raft_snapshot_metadata,
+            serialize_config_change,
+        },
+    };
 
     use self::mockall::predicate::eq;
     use super::*;
     use mock::{MockActor, MockAttestation, MockHost, MockRaft, MockStore};
     use model::ActorError;
-    use raft::eraftpb::ConfChange as RaftConfigChange;
+    use raft::eraftpb::{
+        ConfChange as RaftConfigChange, EntryType as RaftEntryType, MessageType as RaftMessageType,
+    };
 
     fn create_actor_config() -> Vec<u8> {
         Vec::new()
@@ -929,6 +938,14 @@ mod test {
             leader_term: raft_state.leader_term,
             cluster_node_ids: raft_state.committed_cluster_config.clone(),
             has_pending_changes: raft_state.has_pending_change,
+        })
+    }
+
+    fn create_deliver_message(raft_message: &RaftMessage) -> envelope_out::Msg {
+        envelope_out::Msg::DeliverMessage(DeliverMessage {
+            recipient_node_id: raft_message.to,
+            sender_node_id: raft_message.from,
+            message_contents: serialize_raft_message(raft_message).unwrap(),
         })
     }
 
@@ -1038,15 +1055,42 @@ mod test {
             self
         }
 
-        fn expect_has_ready(mut self, has_ready: bool) -> RaftBuilder {
-            self.mock_raft.expect_has_ready().return_const(has_ready);
-            self
-        }
-
         fn expect_should_snapshot(mut self, should_snapshot: bool) -> RaftBuilder {
             self.mock_store
                 .expect_should_snapshot()
                 .return_const(should_snapshot);
+            self
+        }
+
+        fn expect_apply_snapshot(
+            mut self,
+            snapshot: RaftSnapshot,
+            handler: impl Fn(RaftSnapshot) -> Result<(), RaftError> + 'static,
+        ) -> RaftBuilder {
+            self.mock_store
+                .expect_apply_snapshot()
+                .with(eq(snapshot))
+                .return_once_st(handler);
+            self
+        }
+
+        fn expect_append_entries(
+            mut self,
+            entries: Vec<RaftEntry>,
+            handler: impl Fn(&[RaftEntry]) -> Result<(), RaftError> + 'static,
+        ) -> RaftBuilder {
+            self.mock_store
+                .expect_append_entries()
+                .with(eq(entries))
+                .return_once_st(handler);
+            self
+        }
+
+        fn expect_has_ready(mut self, has_ready: bool) -> RaftBuilder {
+            self.mock_raft
+                .expect_has_ready()
+                .once()
+                .return_const(has_ready);
             self
         }
 
@@ -1070,8 +1114,43 @@ mod test {
             self
         }
 
-        fn _expect_ready(mut self, ready: RaftReady) -> RaftBuilder {
-            self.mock_raft.expect_get_ready().return_once(move || ready);
+        fn expect_ready(mut self, ready: &RaftReady) -> RaftBuilder {
+            let ready = ready.clone();
+            self.mock_raft
+                .expect_get_ready()
+                .once()
+                .return_once(move || ready);
+            self
+        }
+
+        fn expect_apply_config_change(
+            mut self,
+            config_change: &RaftConfigChange,
+            result: Result<RaftConfigState, RaftError>,
+        ) -> RaftBuilder {
+            let config_change = config_change.clone();
+            self.mock_raft
+                .expect_apply_config_change()
+                .with(eq(config_change))
+                .once()
+                .return_once_st(move |_| result);
+            self
+        }
+
+        fn expect_advance_ready(
+            mut self,
+            ready_number: u64,
+            light_ready: RaftLightReady,
+        ) -> RaftBuilder {
+            self.mock_raft
+                .expect_advance_ready()
+                .withf_st(move |ready| ready.number() == ready_number)
+                .return_const(light_ready);
+            self
+        }
+
+        fn expect_advance_apply(mut self) -> RaftBuilder {
+            self.mock_raft.expect_advance_apply().return_const(());
             self
         }
 
@@ -1127,6 +1206,32 @@ mod test {
                 .expect_on_process_command()
                 .with(eq(command))
                 .return_once(|_| result);
+
+            self
+        }
+
+        fn expect_no_load_snapshot(
+            &mut self,
+            snapshot: Vec<u8>,
+            result: Result<(), ActorError>,
+        ) -> &mut DriverBuilder {
+            self.mock_actor
+                .expect_on_load_snapshot()
+                .with(eq(snapshot))
+                .return_once(|_| result);
+            self
+        }
+
+        fn expect_on_apply_event(
+            &mut self,
+            index: u64,
+            data: Vec<u8>,
+            result: Result<(), ActorError>,
+        ) -> &mut DriverBuilder {
+            self.mock_actor
+                .expect_on_apply_event()
+                .with(eq(index), eq(data))
+                .return_once(|_, _| result);
 
             self
         }
@@ -1198,6 +1303,7 @@ mod test {
             .expect_leader(false)
             .expect_init(|_, _, _, _| Ok(()))
             .expect_has_ready(false)
+            .expect_has_ready(false)
             .expect_should_snapshot(false)
             .expect_state(&create_default_raft_state(node_id));
 
@@ -1239,6 +1345,7 @@ mod test {
         let raft_builder = RaftBuilder::new()
             .expect_leader(false)
             .expect_init(|_, _, _, _| Ok(()))
+            .expect_has_ready(false)
             .expect_has_ready(false)
             .expect_should_snapshot(false)
             .expect_state(&create_default_raft_state(node_id));
@@ -1328,6 +1435,7 @@ mod test {
             .expect_leader(false)
             .expect_init(|_, _, _, _| Ok(()))
             .expect_has_ready(false)
+            .expect_has_ready(false)
             .expect_should_snapshot(false)
             .expect_state(&create_default_raft_state(node_id))
             .expect_make_config_change_proposal(
@@ -1378,6 +1486,7 @@ mod test {
             .expect_leader(false)
             .expect_init(|_, _, _, _| Ok(()))
             .expect_has_ready(false)
+            .expect_has_ready(false)
             .expect_should_snapshot(false)
             .expect_state(&raft_state)
             .expect_make_config_change_proposal(
@@ -1405,6 +1514,101 @@ mod test {
                 instant + 10,
                 Some(create_check_cluster_request()),
             )
+        );
+    }
+
+    #[test]
+    fn test_driver_raft_ready() {
+        let (node_id, instant, driver_config) = create_default_parameters();
+        let peer_id = 2;
+
+        let raft_state = create_default_raft_state(node_id);
+
+        let message_a = create_raft_message(node_id, peer_id, RaftMessageType::MsgBeat);
+        let messages = vec![message_a.clone()];
+
+        let message_b = create_raft_message(node_id, peer_id, RaftMessageType::MsgAppend);
+        let persisted_messages: Vec<RaftMessage> = vec![message_b.clone()];
+
+        let entries = vec![create_empty_raft_entry(3, 2)];
+
+        let committed_normal_entry =
+            create_raft_entry(2, 2, RaftEntryType::EntryNormal, vec![1, 2, 3]);
+        let config_change = create_raft_config_change(peer_id, RaftConfigChangeType::AddNode);
+        let config_state = create_raft_config_state(vec![node_id, peer_id]);
+        let committed_config_entry = create_raft_entry(
+            3,
+            2,
+            RaftEntryType::EntryConfChange,
+            serialize_config_change(&config_change).unwrap(),
+        );
+        let committed_entries = vec![
+            committed_normal_entry.clone(),
+            committed_config_entry.clone(),
+        ];
+
+        let snapshot = create_raft_snapshot(
+            create_raft_snapshot_metadata(1, 1, create_raft_config_state(vec![node_id, peer_id])),
+            vec![1, 2, 3],
+        );
+
+        let ready = RaftReady::new(
+            messages,
+            persisted_messages,
+            entries.clone(),
+            committed_entries,
+            None,
+            snapshot.clone(),
+            1,
+        );
+
+        let light_ready = RaftLightReady::default();
+
+        let mut mock_host = MockHostBuilder::new()
+            .expect_public_signing_key(vec![])
+            .expect_send_messages(vec![create_start_node_response(node_id)])
+            .expect_send_messages(vec![
+                create_deliver_message(&message_a),
+                create_deliver_message(&message_b),
+            ])
+            .take();
+
+        let raft_builder = RaftBuilder::new()
+            .expect_leader(false)
+            .expect_init(|_, _, _, _| Ok(()))
+            .expect_should_snapshot(false)
+            .expect_state(&raft_state)
+            .expect_has_ready(false)
+            .expect_has_ready(true)
+            .expect_ready(&ready)
+            .expect_advance_ready(ready.number(), light_ready)
+            .expect_advance_apply()
+            .expect_apply_snapshot(snapshot.clone(), |_| Ok(()))
+            .expect_append_entries(entries, |_| Ok(()))
+            .expect_apply_config_change(&config_change, Ok(config_state.clone()));
+
+        let mut driver = DriverBuilder::new(driver_config.clone())
+            .expect_on_init(|_| Ok(()))
+            .expect_no_load_snapshot(snapshot.data.to_vec(), Ok(()))
+            .expect_on_apply_event(
+                committed_normal_entry.index,
+                committed_normal_entry.data.to_vec(),
+                Ok(()),
+            )
+            .take(raft_builder);
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(
+                &mut mock_host,
+                instant,
+                Some(create_start_node_request(true, node_id)),
+            )
+        );
+
+        assert_eq!(
+            Ok(()),
+            driver.receive_message(&mut mock_host, instant + 10, None)
         );
     }
 }

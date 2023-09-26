@@ -4,8 +4,9 @@ use core::fmt;
 use core::result::Result;
 use raft::eraftpb::{
     ConfChange as RaftConfigChange, ConfChangeType as RaftConfigChangeType,
-    ConfState as RaftConfigState, Entry as RaftEntry, Message as RaftMessage,
-    Snapshot as RaftSnapshot, SnapshotMetadata as RaftSnapshotMetadata,
+    ConfState as RaftConfigState, Entry as RaftEntry, EntryType as RaftEntryType,
+    Message as RaftMessage, MessageType as RaftMessageType, Snapshot as RaftSnapshot,
+    SnapshotMetadata as RaftSnapshotMetadata,
 };
 
 #[derive(Debug)]
@@ -51,6 +52,12 @@ pub mod raft {
 
     pub fn serialize_raft_message(message: &RaftMessage) -> Result<Vec<u8>, UtilError> {
         message.write_to_bytes().map_err(|_e| UtilError::Encoding)
+    }
+
+    pub fn serialize_config_change(config_change: &RaftConfigChange) -> Result<Vec<u8>, UtilError> {
+        config_change
+            .write_to_bytes()
+            .map_err(|_e| UtilError::Encoding)
     }
 
     pub fn deserialize_config_change(
@@ -110,10 +117,38 @@ pub mod raft {
         }
     }
 
-    pub fn create_raft_entry(index: u64, term: u64) -> RaftEntry {
+    pub fn create_empty_raft_entry(index: u64, term: u64) -> RaftEntry {
         RaftEntry {
             index,
             term,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_raft_entry(
+        index: u64,
+        term: u64,
+        entry_type: RaftEntryType,
+        data: Vec<u8>,
+    ) -> RaftEntry {
+        RaftEntry {
+            index,
+            term,
+            entry_type,
+            data: data.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_raft_message(
+        node_from: u64,
+        node_to: u64,
+        message_type: RaftMessageType,
+    ) -> RaftMessage {
+        RaftMessage {
+            msg_type: message_type,
+            to: node_to,
+            from: node_from,
             ..Default::default()
         }
     }
@@ -143,6 +178,10 @@ pub mod raft {
 
     pub fn serialize_raft_message(message: &RaftMessage) -> Result<Vec<u8>, UtilError> {
         Ok(message.encode_to_vec())
+    }
+
+    pub fn serialize_config_change(config_change: &RaftConfigChange) -> Result<Vec<u8>, UtilError> {
+        Ok(config_change.encode_to_vec())
     }
 
     pub fn deserialize_config_change(
@@ -196,10 +235,38 @@ pub mod raft {
         }
     }
 
-    pub fn create_raft_entry(index: u64, term: u64) -> RaftEntry {
+    pub fn create_empty_raft_entry(index: u64, term: u64) -> RaftEntry {
         RaftEntry {
             index,
             term,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_raft_entry(
+        index: u64,
+        term: u64,
+        entry_type: RaftEntryType,
+        data: Vec<u8>,
+    ) -> RaftEntry {
+        RaftEntry {
+            index,
+            term,
+            entry_type: entry_type.into(),
+            data: data.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_raft_message(
+        node_from: u64,
+        node_to: u64,
+        message_type: RaftMessageType,
+    ) -> RaftMessage {
+        RaftMessage {
+            msg_type: message_type.into(),
+            to: node_to,
+            from: node_from,
             ..Default::default()
         }
     }

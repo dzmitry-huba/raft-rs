@@ -64,7 +64,7 @@ impl RaftState {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RaftReady {
     messages: Vec<RaftMessage>,
     persisted_messages: Vec<RaftMessage>,
@@ -125,6 +125,7 @@ impl RaftReady {
     }
 }
 
+#[derive(Default, Clone)]
 pub struct RaftLightReady {
     messages: Vec<RaftMessage>,
     committed_entries: Vec<RaftEntry>,

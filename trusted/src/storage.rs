@@ -413,7 +413,7 @@ mod test {
     use crate::{
         logger::log::create_logger,
         util::raft::{
-            create_raft_config_state, create_raft_entry, create_raft_snapshot,
+            create_empty_raft_entry, create_raft_config_state, create_raft_snapshot,
             create_raft_snapshot_metadata, message_size,
         },
     };
@@ -452,9 +452,9 @@ mod test {
     #[test]
     fn test_storage_term() {
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
         ];
 
         let voters = vec![1];
@@ -477,10 +477,10 @@ mod test {
     #[test]
     fn test_storage_entries() {
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
-            create_raft_entry(6, 6),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
+            create_empty_raft_entry(6, 6),
         ];
 
         let voters = vec![1];
@@ -494,32 +494,48 @@ mod test {
                 u64::max_value(),
                 Err(RaftError::Store(RaftStorageError::Compacted)),
             ),
-            (3, 4, u64::max_value(), Ok(vec![create_raft_entry(3, 3)])),
-            (4, 5, u64::max_value(), Ok(vec![create_raft_entry(4, 4)])),
+            (
+                3,
+                4,
+                u64::max_value(),
+                Ok(vec![create_empty_raft_entry(3, 3)]),
+            ),
+            (
+                4,
+                5,
+                u64::max_value(),
+                Ok(vec![create_empty_raft_entry(4, 4)]),
+            ),
             (
                 4,
                 6,
                 u64::max_value(),
-                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+                Ok(vec![
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                ]),
             ),
             (
                 4,
                 7,
                 u64::max_value(),
                 Ok(vec![
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
-                    create_raft_entry(6, 6),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                    create_empty_raft_entry(6, 6),
                 ]),
             ),
             // even if maxsize is zero, the first entry should be returned
-            (4, 7, 0, Ok(vec![create_raft_entry(4, 4)])),
+            (4, 7, 0, Ok(vec![create_empty_raft_entry(4, 4)])),
             // limit to 2
             (
                 4,
                 7,
                 u64::from(message_size(&entries[1]) + message_size(&entries[2])),
-                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+                Ok(vec![
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                ]),
             ),
             (
                 4,
@@ -529,7 +545,10 @@ mod test {
                         + message_size(&entries[2])
                         + message_size(&entries[3]) / 2,
                 ),
-                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+                Ok(vec![
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                ]),
             ),
             (
                 4,
@@ -540,7 +559,10 @@ mod test {
                         + message_size(&entries[3])
                         - 1,
                 ),
-                Ok(vec![create_raft_entry(4, 4), create_raft_entry(5, 5)]),
+                Ok(vec![
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                ]),
             ),
             // all
             (
@@ -552,9 +574,9 @@ mod test {
                         + message_size(&entries[3]),
                 ),
                 Ok(vec![
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
-                    create_raft_entry(6, 6),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                    create_empty_raft_entry(6, 6),
                 ]),
             ),
         ];
@@ -570,9 +592,9 @@ mod test {
     #[test]
     fn test_storage_last_index() {
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
         ];
 
         let voters = vec![1];
@@ -581,7 +603,9 @@ mod test {
 
         assert_eq!(Ok(5), storage.last_index());
 
-        storage.append_entries(&[create_raft_entry(6, 5)]).unwrap();
+        storage
+            .append_entries(&[create_empty_raft_entry(6, 5)])
+            .unwrap();
 
         assert_eq!(Ok(6), storage.last_index());
     }
@@ -589,9 +613,9 @@ mod test {
     #[test]
     fn test_storage_first_index() {
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
         ];
 
         let voters = vec![1];
@@ -608,9 +632,9 @@ mod test {
     #[test]
     fn test_storage_compact_entries() {
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
         ];
 
         let voters = vec![1];
@@ -647,9 +671,9 @@ mod test {
         use std::panic::{self, AssertUnwindSafe};
 
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
         ];
 
         let voters = vec![1];
@@ -657,64 +681,67 @@ mod test {
         let tests = vec![
             (
                 vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
                 ],
                 Some(vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
                 ]),
             ),
             (
                 vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 6),
-                    create_raft_entry(5, 6),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 6),
+                    create_empty_raft_entry(5, 6),
                 ],
                 Some(vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 6),
-                    create_raft_entry(5, 6),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 6),
+                    create_empty_raft_entry(5, 6),
                 ]),
             ),
             (
                 vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
-                    create_raft_entry(6, 5),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                    create_empty_raft_entry(6, 5),
                 ],
                 Some(vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
-                    create_raft_entry(6, 5),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                    create_empty_raft_entry(6, 5),
                 ]),
             ),
             // overwrite compacted raft logs is not allowed
             (
                 vec![
-                    create_raft_entry(2, 3),
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 5),
+                    create_empty_raft_entry(2, 3),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 5),
                 ],
                 None,
             ),
             // truncate the existing entries and append
             (
-                vec![create_raft_entry(4, 5)],
-                Some(vec![create_raft_entry(3, 3), create_raft_entry(4, 5)]),
+                vec![create_empty_raft_entry(4, 5)],
+                Some(vec![
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 5),
+                ]),
             ),
             // direct append
             (
-                vec![create_raft_entry(6, 6)],
+                vec![create_empty_raft_entry(6, 6)],
                 Some(vec![
-                    create_raft_entry(3, 3),
-                    create_raft_entry(4, 4),
-                    create_raft_entry(5, 5),
-                    create_raft_entry(6, 6),
+                    create_empty_raft_entry(3, 3),
+                    create_empty_raft_entry(4, 4),
+                    create_empty_raft_entry(5, 5),
+                    create_empty_raft_entry(6, 6),
                 ]),
             ),
         ];
@@ -746,9 +773,9 @@ mod test {
     #[test]
     fn test_storage_get_snapshot() {
         let entries = vec![
-            create_raft_entry(3, 3),
-            create_raft_entry(4, 4),
-            create_raft_entry(5, 5),
+            create_empty_raft_entry(3, 3),
+            create_empty_raft_entry(4, 4),
+            create_empty_raft_entry(5, 5),
         ];
 
         let mut voters = vec![1];
