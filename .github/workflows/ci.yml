@@ -49,8 +49,8 @@ jobs:
     - name: run tests with no-std enabled
       # No-std implementation uses feature that can only be compiled by nightly version
       if: ${{ matrix.rust == 'nightly' }}
-      run: cargo test --all --no-default-features --features=protobuf-codec --features=default-logger -- --nocapture
-    - run: cargo test --all -- --nocapture
+      run: cargo test --all --no-default-features --features=prost-codec --features=default-logger --no-fail-fast -- --nocapture
+    - run: cargo test --all  --no-fail-fast -- --nocapture
     # Validate benches still work.
     - run: cargo bench --all -- --test
     # Because failpoints inject failure in code path, which will affect all concurrently running tests, Hence they need to be synchronized, which make tests slow.

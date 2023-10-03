@@ -1157,14 +1157,14 @@ mod test {
     fn test_slice() {
         use crate::errors::{Error, StorageError};
         use crate::raft_log;
-        use protobuf::Message as PbMessage;
+        use crate::util::compute_size;
         use std::panic::{self, AssertUnwindSafe};
 
         let (offset, num) = (100u64, 100u64);
         let (last, half) = (offset + num, offset + num / 2);
         let halfe = new_entry(half, half);
 
-        let halfe_size = u64::from(halfe.compute_size());
+        let halfe_size = u64::from(compute_size(&halfe));
 
         let store = MemStorage::new();
         store

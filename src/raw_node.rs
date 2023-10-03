@@ -25,7 +25,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
 
-use protobuf::Message as PbMessage;
+#[cfg(feature = "protobuf-codec")]
+use protobuf::Message as _;
 use raft_proto::ConfChangeI;
 use slog::Logger;
 

@@ -18,14 +18,16 @@ use alloc::vec::Vec;
 use core::cmp;
 use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
+use rand::rngs::SmallRng;
 
 use crate::eraftpb::{
     ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
     Snapshot,
 };
+#[cfg(feature = "protobuf-codec")]
 use protobuf::Message as _;
 use raft_proto::ConfChangeI;
-use rand::{self, Rng};
+use rand::{self, Rng, SeedableRng};
 use slog::{self, Logger};
 
 #[cfg(feature = "failpoints")]
@@ -257,6 +259,8 @@ pub struct RaftCore<T: Storage> {
 
     /// Max size per committed entries in a `Read`.
     pub(crate) max_committed_size_per_ready: u64,
+
+    random: SmallRng,
 }
 
 /// A struct that represents the raft consensus itself. Stores details concerning the current
@@ -365,6 +369,7 @@ impl<T: Storage> Raft<T> {
                     last_log_tail_index: 0,
                 },
                 max_committed_size_per_ready: c.max_committed_size_per_ready,
+                random: SmallRng::from_entropy(),
             },
         };
         confchange::restore(&mut r.prs, r.r.raft_log.last_index(), conf_state)?;
@@ -2802,8 +2807,13 @@ impl<T: Storage> Raft<T> {
     /// Regenerates and stores the election timeout.
     pub fn reset_randomized_election_timeout(&mut self) {
         let prev_timeout = self.randomized_election_timeout;
-        let timeout =
-            rand::thread_rng().gen_range(self.min_election_timeout..self.max_election_timeout);
+
+        let timeout = self
+            .r
+            .random
+            .gen_range(self.min_election_timeout..self.max_election_timeout);
+        // let timeout = (self.min_election_timeout + self.max_election_timeout) / 2;
+
         debug!(
             self.logger,
             "reset election timeout {prev_timeout} -> {timeout} at {election_elapsed}",

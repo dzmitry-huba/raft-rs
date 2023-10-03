@@ -542,10 +542,14 @@ mod test {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    #[cfg(feature = "prost-codec")]
+    use prost::Message as PbMessage;
+    #[cfg(feature = "protobuf-codec")]
     use protobuf::Message as PbMessage;
 
     use crate::eraftpb::{ConfState, Entry, Snapshot};
     use crate::errors::{Error as RaftError, StorageError};
+    use crate::util::compute_size;
 
     use super::{GetEntriesContext, MemStorage, Storage};
 
@@ -557,7 +561,7 @@ mod test {
     }
 
     fn size_of<T: PbMessage>(m: &T) -> u32 {
-        m.compute_size()
+        compute_size(m)
     }
 
     fn new_snapshot(index: u64, term: u64, voters: Vec<u64>) -> Snapshot {

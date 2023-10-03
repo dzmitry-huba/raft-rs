@@ -14,6 +14,9 @@ use slog::{OwnedKVList, Record, KV};
 
 use crate::eraftpb::{Entry, Message};
 use crate::HashSet;
+#[cfg(not(feature = "protobuf-codec"))]
+use ::prost::Message as PbMessage;
+#[cfg(feature = "protobuf-codec")]
 use protobuf::Message as PbMessage;
 
 use slog::{b, record_static};
@@ -66,10 +69,10 @@ pub fn limit_size<T: PbMessage + Clone>(entries: &mut Vec<T>, max: Option<u64>) 
         .iter()
         .take_while(|&e| {
             if size == 0 {
-                size += u64::from(e.compute_size());
+                size += u64::from(compute_size(e));
                 return true;
             }
-            size += u64::from(e.compute_size());
+            size += u64::from(compute_size(e));
             size <= max
         })
         .count();
@@ -85,6 +88,18 @@ pub fn is_continuous_ents(msg: &Message, ents: &[Entry]) -> bool {
         return expected_next_idx == ents.first().unwrap().index;
     }
     true
+}
+
+#[cfg(feature = "protobuf-codec")]
+/// Computes the size of the serialized protobuf message.
+pub fn compute_size<T: PbMessage>(entry: &T) -> u32 {
+    entry.compute_size()
+}
+
+#[cfg(feature = "prost-codec")]
+/// Computes the size of the serialized prost message.
+pub fn compute_size<T: PbMessage>(entry: &T) -> u32 {
+    entry.encoded_len().try_into().unwrap()
 }
 
 struct FormatKeyValueList {

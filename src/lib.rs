@@ -448,7 +448,6 @@ the following:
 For example to promote a learner 4 and demote an existing voter 3:
 ```no_run
 # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::*};
-# use protobuf::Message as PbMessage;
 # use slog::{Drain, o};
 #
 # let mut config = Config { id: 1, ..Default::default() };
@@ -608,7 +607,10 @@ pub fn default_logger() -> slog::Logger {
 
 extern crate alloc;
 
+#[cfg(feature = "std")]
 type DefaultHashBuilder = core::hash::BuildHasherDefault<fxhash::FxHasher>;
+#[cfg(not(feature = "std"))]
+type DefaultHashBuilder = core::hash::BuildHasherDefault<ahash::AHasher>;
 
 #[cfg(feature = "std")]
 use {

@@ -22,7 +22,11 @@ pub enum Error {
     /// The configuration is invalid.
     ConfigInvalid(String),
     /// A protobuf message codec failed in some manner.
+    #[cfg(feature = "protobuf-codec")]
     CodecError(protobuf::ProtobufError),
+    #[cfg(feature = "prost-codec")]
+    /// A prost message codec failed in some manner.
+    CodecError(),
     /// The node exists, but should not.
     Exists {
         /// The node id.
@@ -53,7 +57,10 @@ impl fmt::Display for Error {
             Error::StepPeerNotFound => write!(f, "raft: cannot step as peer not found"),
             Error::ProposalDropped => write!(f, "raft: proposal dropped"),
             Error::ConfigInvalid(ref m) => write!(f, "{}", m),
+            #[cfg(feature = "protobuf-codec")]
             Error::CodecError(ref e) => write!(f, "protobuf codec error {0:?}", e),
+            #[cfg(feature = "prost-codec")]
+            Error::CodecError() => write!(f, "prost codec error"),
             Error::Exists { id, set } => {
                 write!(f, "The node {id} already exists in the {set} set.")
             }
@@ -72,7 +79,10 @@ impl StdError for Error {
             #[cfg(feature = "std")]
             Error::Io(ref e) => Some(e),
             Error::Store(ref e) => Some(e),
+            #[cfg(feature = "protobuf-codec")]
             Error::CodecError(ref e) => Some(e),
+            #[cfg(feature = "prost-codec")]
+            Error::CodecError() => None,
             _ => None,
         }
     }
@@ -91,9 +101,17 @@ impl From<StorageError> for Error {
     }
 }
 
+#[cfg(feature = "protobuf-codec")]
 impl From<protobuf::ProtobufError> for Error {
     fn from(err: protobuf::ProtobufError) -> Error {
         Error::CodecError(err)
+    }
+}
+
+#[cfg(feature = "prost-codec")]
+impl From<prost::EncodeError> for Error {
+    fn from(_: prost::EncodeError) -> Error {
+        Error::CodecError()
     }
 }
 
